@@ -36,7 +36,7 @@ jobs:
           } else if (process.env.GITHUB_EVENT_NAME === 'release' && event.action === 'published' && event.release?.draft === false) {
             const tag = event.release.tag_name;
             if (typeof tag !== 'string' || !tag || /[\r\n]/.test(tag)) throw new Error('Missing or invalid release tag.');
-            scriptId = '1EfpkaHJ7BmEaIIKBZl72HzdjtoSJmVssOxd86-x-q6RFWjWrzr2i-GjG';
+            scriptId = '1PBiZPovBbRTPbNsVWImC1A0TW4U_wbYkhVCAgOVn6E4iBXJ8umjdaCuT';
             ref = `refs/tags/${tag}`;
             environment = 'production';
           } else {

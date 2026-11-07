@@ -5,14 +5,14 @@
 | タイミング | 反映先 | 反映するコード |
 | --- | --- | --- |
 | `main` に push | [テスト用シート](https://docs.google.com/spreadsheets/d/1FySsnrRI4uZb1SCxDsng3LAQQZvBHw1tB8MaKTorfkE/edit) | その push のコミット |
-| GitHub Release を公開 | [本番用シート](https://docs.google.com/spreadsheets/d/1sDSV2-9KGVr04cRFovnKopbwBwM9mJtFHU108_2bxJE/edit) | 公開したリリースのタグが指すコミット |
+| GitHub Release を公開 | [本番用シート](https://docs.google.com/spreadsheets/d/1daXwWab7hvy31oJOvlUTYK5x62egWdOt8Oia4Vwi56k/edit) | 公開したリリースのタグが指すコミット |
 
 スクリプト ID はワークフロー内に固定しています。
 
 | 環境 | スクリプト ID |
 | --- | --- |
 | テスト | `1ba_yMwjRt-z2PHcyCRrNkYtPnP5TSYxFJH993ywaL-dUFKp2l-e5Samw` |
-| 本番 | `1EfpkaHJ7BmEaIIKBZl72HzdjtoSJmVssOxd86-x-q6RFWjWrzr2i-GjG` |
+| 本番 | `1PBiZPovBbRTPbNsVWImC1A0TW4U_wbYkhVCAgOVn6E4iBXJ8umjdaCuT` |
 
 通常の開発・デバッグ・抽選の試行はテスト用シートで行います。`main` の更新は本番のスクリプトを更新しません。コードは対象シートに紐づく `SpreadsheetApp.getActiveSpreadsheet()` を使う方針とし、本番シートの ID をコードに固定しないでください。
 
