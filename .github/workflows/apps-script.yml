@@ -106,6 +106,10 @@ jobs:
           console.log(`Validated ${scripts.length} script file(s).`);
           NODE
 
+      - name: Test lottery implementation
+        shell: bash
+        run: node --test tests/committee-lottery.test.cjs
+
       - name: Install clasp
         shell: bash
         run: |

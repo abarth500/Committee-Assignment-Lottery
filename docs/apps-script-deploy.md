@@ -32,7 +32,7 @@
    npx --yes @google/clasp@3.4.1 show-file-status
    ```
 
-   以後は `apps-script/` 内でプログラムを作成します。初期のサンプル関数を同期するだけでは目的の機能は実装されません。TypeScript を直接送信する設定ではありません。
+   以後は `apps-script/` 内で開発します。取り込んだコードと README の仕様を照合してください。TypeScript を直接送信する設定ではありません。
 
 4. GitHub の **Settings → Secrets and variables → Actions** で次を登録します。
 
@@ -50,7 +50,7 @@
    gh secret set CLASP_AUTH_JSON --repo abarth500/Committee-Assignment-Lottery < ~/.clasprc.json
    ```
 
-   このクラウドからの GitHub API の Secret 一覧取得は `Forbidden` だったため、既存 Secret の有無は未確認です。登録済みで使用可能なら、その設定を再利用してください。
+   登録済みで使用可能な Secret は、その設定を再利用してください。
 
 5. コードと設定を `main` に反映し、Actions の **Sync Apps Script** が成功したことを確認して、テスト用シートで動作を確認します。
 
@@ -70,6 +70,6 @@
 
 `clasp push --force` は対象のオンラインプロジェクト全体（マニフェストを含む）をローカルの内容で置き換えます。ローカルにないオンラインのファイルは削除対象になります。既存コードがあるプロジェクトへ反映する場合や、オンラインエディタで後から変更した場合は、すべて Git に取り込んでから同期します。
 
-ワークフローは送信前に、イベントと宛先、マニフェスト、ソースの存在、JavaScript 構文、認証形式を確認します。これは Apps Script の実行テストではないため、Google 側での認可、メニュー、ボタン、トリガーなどの動作確認は別途必要です。
+ワークフローは送信前に、イベントと宛先、マニフェスト、ソースの存在、JavaScript 構文、認証形式を確認し、`node --test tests/committee-lottery.test.cjs` を実行します。失敗時は同期しません。Google 側での認可、メニューと実際のシート入出力の動作確認は別途必要です。
 
-初回用の `apps-script/CommitteeLottery.js` とマニフェストは登録済みです。ローカルの構文・イベント分岐・送信対象ファイルの検証に加え、実際の同期結果は Actions の各実行結果で確認してください。成功後、対象シートを開いて `myFunction` を手動実行すると確認用の通知が表示されます。デプロイによって関数が自動実行されるわけではありません。
+同期成功後、テスト用シートを開き直して「委員抽選」メニューを確認します。まず `previewCommitteeLottery`（または互換用の `myFunction`）で書込なしの入力確認を行い、次に `runCommitteeLottery` で抽選と新規出力の保存を行います。初回は現在のスプレッドシートへの権限を許可してください。詳しい操作・出力状態の確認は README の「プログラムの使い方と実装解説」を参照してください。デプロイやシートの表示だけでは抽選は実行されません。
