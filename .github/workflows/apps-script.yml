@@ -1,0 +1,141 @@
+name: Sync Apps Script
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apps-script-${{ github.repository }}-${{ github.event_name == 'release' && 'production' || 'test' }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync to ${{ github.event_name == 'release' && 'production' || 'test' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Select deployment target
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+          let scriptId, ref, environment;
+          if (process.env.GITHUB_EVENT_NAME === 'push' && process.env.GITHUB_REF === 'refs/heads/main') {
+            scriptId = '1ba_yMwjRt-z2PHcyCRrNkYtPnP5TSYxFJH993ywaL-dUFKp2l-e5Samw';
+            ref = process.env.GITHUB_SHA;
+            environment = 'test';
+            if (!/^[0-9a-f]{40}$/.test(ref || '')) throw new Error('Missing push commit SHA.');
+          } else if (process.env.GITHUB_EVENT_NAME === 'release' && event.action === 'published' && event.release?.draft === false) {
+            const tag = event.release.tag_name;
+            if (typeof tag !== 'string' || !tag || /[\r\n]/.test(tag)) throw new Error('Missing or invalid release tag.');
+            scriptId = '1EfpkaHJ7BmEaIIKBZl72HzdjtoSJmVssOxd86-x-q6RFWjWrzr2i-GjG';
+            ref = `refs/tags/${tag}`;
+            environment = 'production';
+          } else {
+            throw new Error('Only main pushes and published releases may sync Apps Script.');
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `script_id=${scriptId}\ncheckout_ref=${ref}\nenvironment=${environment}\n`);
+          console.log(`Selected ${environment}: ${ref}`);
+          NODE
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ steps.target.outputs.checkout_ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+
+      - name: Validate source and target
+        shell: bash
+        env:
+          APPS_SCRIPT_ID: ${{ steps.target.outputs.script_id }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { spawnSync } = require('node:child_process');
+          function fail(message) { console.error(message); process.exit(1); }
+          const scriptId = process.env.APPS_SCRIPT_ID;
+          if (!scriptId || !/^[A-Za-z0-9_-]{20,}$/.test(scriptId)) {
+            fail('A valid Apps Script target ID is required.');
+          }
+          const rootDir = path.resolve('apps-script');
+          if (!fs.existsSync(rootDir) || fs.lstatSync(rootDir).isSymbolicLink()) {
+            fail('Place the complete Apps Script project in apps-script/ before syncing.');
+          }
+          const files = [];
+          function walk(dir) {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const file = path.join(dir, entry.name);
+              if (entry.isSymbolicLink()) fail('Symlinks are not supported in apps-script/.');
+              if (entry.isDirectory()) walk(file);
+              else files.push(file);
+            }
+          }
+          walk(rootDir);
+          const manifestPath = path.join(rootDir, 'appsscript.json');
+          if (!files.includes(manifestPath)) fail('apps-script/appsscript.json is required.');
+          let manifest;
+          try { manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); }
+          catch { fail('appsscript.json must be valid JSON.'); }
+          if (!manifest || Array.isArray(manifest) || typeof manifest !== 'object') {
+            fail('appsscript.json must contain a JSON object.');
+          }
+          if (files.some(file => file.endsWith('.ts'))) fail('Compile TypeScript to Apps Script JavaScript before syncing.');
+          const scripts = files.filter(file => /\.(gs|js)$/.test(file));
+          if (!scripts.length) fail('No .gs or .js source files found; refusing to sync an empty project.');
+          for (const file of scripts) {
+            const result = spawnSync(process.execPath, ['--check'], {
+              input: fs.readFileSync(file), encoding: 'utf8'
+            });
+            if (result.status !== 0) fail(`JavaScript syntax check failed: ${path.relative(rootDir, file)}`);
+          }
+          fs.writeFileSync('.clasp-ci.json', JSON.stringify({
+            scriptId, rootDir: 'apps-script', scriptExtensions: ['.js', '.gs']
+          }), { flag: 'wx' });
+          console.log(`Validated ${scripts.length} script file(s).`);
+          NODE
+
+      - name: Install clasp
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/clasp" --no-save --package-lock=false --ignore-scripts --no-audit --no-fund @google/clasp@3.4.1
+          "$RUNNER_TEMP/clasp/node_modules/.bin/clasp" --version
+
+      - name: Sync complete project
+        shell: bash
+        env:
+          CLASP_AUTH_JSON: ${{ secrets.CLASP_AUTH_JSON }}
+        run: |
+          set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/clasp-auth.json" "$GITHUB_WORKSPACE/.clasp-ci.json"' EXIT
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          let auth;
+          try { auth = JSON.parse(process.env.CLASP_AUTH_JSON || ''); } catch {
+            console.error('Set CLASP_AUTH_JSON to the complete .clasprc.json produced by clasp 3.4.1 login.');
+            process.exit(1);
+          }
+          const token = auth?.tokens?.default;
+          if (!token?.refresh_token || !token?.client_id || !token?.client_secret) {
+            console.error('CLASP_AUTH_JSON needs default-user OAuth credentials from clasp 3.4.1 login.');
+            process.exit(1);
+          }
+          fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'clasp-auth.json'), JSON.stringify(auth), { mode: 0o600 });
+          NODE
+          unset CLASP_AUTH_JSON
+          clasp="$RUNNER_TEMP/clasp/node_modules/.bin/clasp"
+          "$clasp" --auth "$RUNNER_TEMP/clasp-auth.json" --project "$GITHUB_WORKSPACE/.clasp-ci.json" show-file-status
+          "$clasp" --auth "$RUNNER_TEMP/clasp-auth.json" --project "$GITHUB_WORKSPACE/.clasp-ci.json" push --force
