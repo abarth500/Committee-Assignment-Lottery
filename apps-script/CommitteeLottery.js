@@ -1,6 +1,11 @@
 const LOTTERY_SEED = '72f7c0a2629261e23b8f7627a22233d17c72740d6305acdc9716789bf70ec83c';
-const LOTTERY_VERSION = '1.0.0';
+const LOTTERY_VERSION = '1.1.0';
+const LOTTERY_ALGORITHM_VERSION = '1.0.0';
 const LOTTERY_PRNG = 'SHA-256-chain / uint32-be / rejection-sampling / Fisher-Yates';
+const LOTTERY_OUTPUT_OWNER = 'CommitteeAssignmentLottery/output-v2';
+const LOTTERY_OUTPUT_LABELS = Object.freeze(['結果', '役職希望者', '実行情報', '詳細ログ', '元データ統計', '結果統計', '入力控え']);
+const LOTTERY_HISTORY_NAME = '抽選_実行履歴';
+const LOTTERY_HISTORY_HEADER = Object.freeze(['実行日時', '実行ID', '記録種別', '抽選状態', '採用試行', '結果SHA256', '全試行ログSHA256', '再検証情報（JSON）']);
 const LOTTERY_SETTINGS = Object.freeze({
   committees: Object.freeze(['企画班', '司会進行班', '音響照明班', '会場演出班', '有志団体統括班']),
   classes: Object.freeze(['A組', 'B組', 'C組', 'D組', 'E組']),
@@ -16,7 +21,8 @@ const LOTTERY_SETTINGS = Object.freeze({
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('委員抽選')
     .addItem('入力・成立条件を確認（書込なし）', 'previewCommitteeLottery')
-    .addItem('抽選を実行して新規シートに保存', 'runCommitteeLottery')
+    .addItem('抽選を実行して最新結果を保存', 'runCommitteeLottery')
+    .addItem('実行履歴をハッシュ照合（書込なし）', 'verifyLotteryHistory')
     .addToUi();
 }
 
@@ -44,7 +50,7 @@ function previewCommitteeLottery() {
   return summary;
 }
 
-/** この関数を明示的に実行したときだけ、新しい出力シートを追加する。 */
+/** 最新出力の置換は、入力照合・履歴保存・新出力の保存が済んだ後に行う。 */
 function runCommitteeLottery() {
   const lock = LockService.getDocumentLock();
   if (!lock || !lock.tryLock(1000)) {
@@ -59,8 +65,9 @@ function runCommitteeLottery() {
       seed: LOTTERY_SEED, runId: runId, startedAt: now.toISOString(),
       flush: function () { SpreadsheetApp.flush(); }
     });
-    spreadsheet.toast(summary.status === 'ACCEPTED' ? '抽選結果を保存しました。' :
-      '選出未成立です。詳細ログと統計を確認してください。', '委員抽選', 10);
+    const message = summary.status === 'ACCEPTED' ? '最新の抽選結果を保存しました。' :
+      '今回は選出未成立です。実行情報とログを確認してください。';
+    spreadsheet.toast(message + (summary.warnings.length ? '\n旧出力の整理に注意事項があります。' : ''), '委員抽選', 10);
     return summary;
   } finally {
     lock.releaseLock();
@@ -523,7 +530,7 @@ function sortedAssignments_(assignments, people) {
 function buildOutputPlans_(captured, result, context) {
   const people = new Map(result.prepared.candidates.map(function (p) { return [p.key, p]; }));
   const metadata = [
-    ['実行ID', context.runId], ['状態', '保存中・当選未確定'], ['方式の版', result.version], ['シード', result.seed],
+    ['実行ID', context.runId], ['状態', '保存中・当選未確定'], ['コードの版', result.version], ['シード', result.seed],
     ['乱数方式', result.prng], ['元回答SHA256', snapshotHash_(captured.responses.values, context.digest)],
     ['運営確認SHA256', snapshotHash_(captured.operations.values, context.digest)], ['採用試行', result.acceptedAttempt || 'なし'],
     ['実施試行数', result.attempts.length], ['消費した乱数の個数', result.randomPosition],
@@ -531,7 +538,10 @@ function buildOutputPlans_(captured, result, context) {
     ['元回答シート・範囲', captured.responses.name + '!' + captured.responses.range],
     ['運営確認シート・範囲', captured.operations.name + '!' + captured.operations.range]
   ];
-  function plan(label, header, rows) { return { label: label, rows: metadata.map(function (r) { return r.slice(); }).concat([[], header], rows) }; }
+  const record = context.record || makeRunRecord_(captured, result, context);
+  metadata.push(['抽選アルゴリズムの版', record.algorithmVersion], ['Gitリビジョン', record.sourceRevision],
+    ['結果SHA256', record.resultHash], ['全試行ログSHA256', record.auditHash]);
+  function plan(label, header, rows) { return { label: label, rows: [header].concat(rows), record: record }; }
   const selectedRows = sortedAssignments_(result.assignments, people).map(function (assignment) {
     const person = people.get(assignment.key);
     return [assignment.committee, person.className, person.number, person.name,
@@ -594,12 +604,13 @@ function buildOutputPlans_(captured, result, context) {
   });
   return [
     plan('結果', ['班', 'クラス', '出席番号', '名前', '当選段階', '元回答行', '役職希望'], selectedRows),
+    plan('役職希望者', ['班', 'クラス', '出席番号', '名前', '元回答行'], leaderRows),
+    plan('実行情報', ['項目', '内容'], metadata),
     plan('詳細ログ', ['連番', '種別', '内容（JSON）'], result.audit.map(function (event) {
       return [event.sequence, event.type, JSON.stringify(event.detail)];
     })),
     plan('元データ統計', ['項目', '区分', '人数・件数', '注記'], inputStats),
     plan('結果統計', ['試行', '採否', '項目', '区分', '人数', '条件・備考'], resultStats),
-    plan('役職希望者', ['班', 'クラス', '出席番号', '名前', '元回答行'], leaderRows),
     plan('入力控え', ['入力種別', '元シートID', '元シート名', '元行番号', '値のJSON（型付き）'], snapshots)
   ];
 }
@@ -609,75 +620,435 @@ function safeCell_(value) {
   return value === null || value === undefined ? '' : value;
 }
 
-function writeOutputPlans_(spreadsheet, plans, runId, status, flush) {
-  flush = flush || function () {};
-  let uniqueId = runId; let suffix = 1;
-  while (plans.some(function (plan) { return spreadsheet.getSheetByName(LOTTERY_SETTINGS.outputPrefix + uniqueId + '_' + plan.label); })) {
-    uniqueId = runId + '_' + suffix; suffix += 1;
-  }
-  const preparedPlans = plans.map(function (plan) {
-    const width = Math.max.apply(null, plan.rows.map(function (row) { return row.length; }));
-    const rows = plan.rows.map(function (row, index) {
-      const result = row.map(safeCell_);
-      if (index === 0) result[1] = uniqueId;
-      while (result.length < width) result.push('');
-      result.forEach(function (cell) {
-        if (typeof cell === 'string' && cell.length > 45000) throw new Error('入力またはログが1セルの保存上限を超えます。');
+function sourceRevision_() {
+  return typeof LOTTERY_BUILD_REVISION === 'string' ? LOTTERY_BUILD_REVISION : 'manual-build';
+}
+
+function hashResult_(status, acceptedAttempt, assignments, leaders, digest) {
+  function ordered(items) {
+    return items.map(function (a) { return { key: a.key, committee: a.committee, stage: a.stage }; })
+      .sort(function (a, b) {
+        const first = a.key.split(':'); const second = b.key.split(':');
+        return LOTTERY_SETTINGS.committees.indexOf(a.committee) - LOTTERY_SETTINGS.committees.indexOf(b.committee) ||
+          LOTTERY_SETTINGS.classes.indexOf(first[0]) - LOTTERY_SETTINGS.classes.indexOf(second[0]) ||
+          Number(first[1]) - Number(second[1]);
       });
-      return result;
+  }
+  return hashText_(JSON.stringify({ schema: 'lottery-result/v1', status: status,
+    acceptedAttempt: acceptedAttempt, assignments: ordered(assignments), leadershipCandidates: ordered(leaders) }), digest);
+}
+
+function makeRunRecord_(captured, result, context) {
+  return {
+    schema: 'lottery-history/v1', runId: context.runId, startedAt: context.startedAt,
+    version: result.version, algorithmVersion: LOTTERY_ALGORITHM_VERSION,
+    sourceRevision: context.sourceRevision || sourceRevision_(), seed: result.seed, status: result.status,
+    acceptedAttempt: result.acceptedAttempt, attempts: result.attempts.length,
+    responsesHash: snapshotHash_(captured.responses.values, context.digest),
+    operationsHash: snapshotHash_(captured.operations.values, context.digest),
+    resultHash: hashResult_(result.status, result.acceptedAttempt, result.assignments, result.leadershipCandidates, context.digest),
+    auditHash: hashText_(JSON.stringify(result.audit), context.digest),
+    randomPosition: result.randomPosition, finalRandomState: result.finalRandomState
+  };
+}
+
+function validRunRecord_(record) {
+  return record && record.schema === 'lottery-history/v1' &&
+    typeof record.runId === 'string' && record.runId.length > 0 &&
+    ['startedAt', 'version', 'algorithmVersion', 'sourceRevision'].every(function (field) {
+      return typeof record[field] === 'string' && record[field].length > 0;
+    }) &&
+    Number.isInteger(record.attempts) && record.attempts >= 0 && record.attempts <= LOTTERY_SETTINGS.maximumAttempts &&
+    Number.isInteger(record.randomPosition) && record.randomPosition >= 0 &&
+    /^[0-9a-f]{64}$/.test(record.finalRandomState || '') &&
+    (record.status === 'ACCEPTED' ? Number.isInteger(record.acceptedAttempt) && record.acceptedAttempt >= 1 &&
+      record.acceptedAttempt <= record.attempts : record.acceptedAttempt === null) &&
+    /^[0-9a-f]{64}$/.test(record.seed || '') &&
+    ['responsesHash', 'operationsHash', 'resultHash', 'auditHash'].every(function (field) {
+      return /^[0-9a-f]{64}$/.test(record[field] || '');
+    }) &&
+    ['ACCEPTED', 'PRECHECK_FAILED', 'ATTEMPT_LIMIT_REACHED'].includes(record.status);
+}
+
+function readOutputNote_(sheet) {
+  let note;
+  try { note = JSON.parse(sheet.getRange(1, 1).getNote() || 'null'); } catch (error) { return null; }
+  return note && note.owner === LOTTERY_OUTPUT_OWNER ? note : null;
+}
+
+function markOutput_(sheet, label, record, phase) {
+  sheet.getRange(1, 1).setNote(JSON.stringify({
+    owner: LOTTERY_OUTPUT_OWNER, kind: 'output', schema: 2, label: label, phase: phase, record: record
+  }));
+  if (label === '実行情報') {
+    sheet.getRange(3, 2).setValue(phase === 'published' ? displayStatus_(record.status) :
+      phase === 'failed' ? '出力失敗・当選未確定' : '保存中・当選未確定');
+  }
+}
+
+function historyRows_(sheet) {
+  if (!sheet) return [];
+  const note = readOutputNote_(sheet);
+  if (!note || note.kind !== 'history') throw new Error('「抽選_実行履歴」がプログラム管理外のシートと衝突しています。');
+  const values = sheet.getDataRange().getValues();
+  if (values.every(function (row) { return row.every(function (v) { return text_(v) === ''; }); })) return [];
+  if (JSON.stringify(values[0].slice(0, LOTTERY_HISTORY_HEADER.length)) !== JSON.stringify(LOTTERY_HISTORY_HEADER)) {
+    throw new Error('実行履歴の見出しが変更されています。履歴を保全したまま確認してください。');
+  }
+  return values.slice(1).filter(function (row) { return row.some(function (v) { return text_(v) !== ''; }); })
+    .map(function (row) {
+      let record;
+      try { record = JSON.parse(row[7]); } catch (error) { throw new Error('実行履歴の再検証情報が不正です。'); }
+      if (!validRunRecord_(record) || text_(row[0]) !== record.startedAt || text_(row[1]) !== record.runId ||
+          text_(row[3]) !== displayStatus_(record.status) || text_(row[4]) !== text_(record.acceptedAttempt || 'なし') ||
+          row[5] !== record.resultHash || row[6] !== record.auditHash) {
+        throw new Error('実行履歴のハッシュと再検証情報が一致しません。');
+      }
+      return { event: text_(row[2]), record: record };
     });
-    return { label: plan.label, name: LOTTERY_SETTINGS.outputPrefix + uniqueId + '_' + plan.label, width: width, rows: rows };
+}
+
+function appendHistory_(spreadsheet, entries) {
+  if (!entries.length) return;
+  let sheet = spreadsheet.getSheetByName(LOTTERY_HISTORY_NAME);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(LOTTERY_HISTORY_NAME);
+    sheet.getRange(1, 1).setNote(JSON.stringify({ owner: LOTTERY_OUTPUT_OWNER, kind: 'history', schema: 1 }));
+    sheet.getRange(1, 1, 1, LOTTERY_HISTORY_HEADER.length).setValues([LOTTERY_HISTORY_HEADER.slice()]);
+    formatOutput_(sheet, '実行履歴', 1, LOTTERY_HISTORY_HEADER.length);
+  } else {
+    historyRows_(sheet);
+    if (sheet.getRange(1, 1, 1, LOTTERY_HISTORY_HEADER.length).getValues()[0].every(function (v) { return text_(v) === ''; })) {
+      sheet.getRange(1, 1, 1, LOTTERY_HISTORY_HEADER.length).setValues([LOTTERY_HISTORY_HEADER.slice()]);
+    }
+  }
+  const rows = entries.map(function (entry) {
+    const r = entry.record;
+    return [r.startedAt, r.runId, entry.event, displayStatus_(r.status), r.acceptedAttempt || 'なし',
+      r.resultHash, r.auditHash, JSON.stringify(r)].map(safeCell_);
   });
-  const created = [];
+  const first = sheet.getLastRow() + 1;
+  if (sheet.getMaxRows() < first + rows.length - 1) {
+    sheet.insertRowsAfter(sheet.getMaxRows(), first + rows.length - 1 - sheet.getMaxRows());
+  }
+  sheet.getRange(first, 1, rows.length, LOTTERY_HISTORY_HEADER.length).setNumberFormat('@').setValues(rows);
+}
+
+function legacyOutput_(sheet) {
+  const values = sheet.getDataRange().getValues();
+  const keys = ['実行ID', '状態', '方式の版', 'シード', '乱数方式', '元回答SHA256', '運営確認SHA256',
+    '採用試行', '実施試行数', '消費した乱数の個数', '最終乱数状態', '実行開始日時', 'タイムゾーン',
+    '元回答シート・範囲', '運営確認シート・範囲'];
+  if (values.length < 17 || !keys.every(function (key, i) { return values[i][0] === key; })) return null;
+  const meta = {};
+  keys.forEach(function (key, i) { meta[key] = values[i][1]; });
+  if (meta['方式の版'] !== '1.0.0' || meta['乱数方式'] !== LOTTERY_PRNG) return null;
+  const headers = {
+    '結果': ['班', 'クラス', '出席番号', '名前', '当選段階', '元回答行', '役職希望'],
+    '役職希望者': ['班', 'クラス', '出席番号', '名前', '元回答行'],
+    '詳細ログ': ['連番', '種別', '内容（JSON）'],
+    '元データ統計': ['項目', '区分', '人数・件数', '注記'],
+    '結果統計': ['試行', '採否', '項目', '区分', '人数', '条件・備考'],
+    '入力控え': ['入力種別', '元シートID', '元シート名', '元行番号', '値のJSON（型付き）']
+  };
+  const labels = Object.keys(headers).filter(function (label) {
+    return JSON.stringify(values[16].slice(0, headers[label].length)) === JSON.stringify(headers[label]);
+  });
+  return labels.length === 1 ? { sheet: sheet, label: labels[0], meta: meta, body: values.slice(17) } : null;
+}
+
+function legacyRecord_(items, digest) {
+  if (items.length !== 6 || new Set(items.map(function (item) { return item.label; })).size !== 6) return null;
+  const meta = items[0].meta;
+  if (!items.every(function (item) { return JSON.stringify(item.meta) === JSON.stringify(meta); })) {
+    throw new Error('旧出力の実行情報が同じ実行内で一致しません。過去の出力を確認してください。');
+  }
+  const statuses = { '成立': 'ACCEPTED', '事前条件不成立': 'PRECHECK_FAILED', '試行上限到達・選出未成立': 'ATTEMPT_LIMIT_REACHED' };
+  const status = statuses[meta['状態']];
+  if (!status) return null;
+  const resultItem = items.find(function (item) { return item.label === '結果'; });
+  const leaderItem = items.find(function (item) { return item.label === '役職希望者'; });
+  const auditItem = items.find(function (item) { return item.label === '詳細ログ'; });
+  const assignments = resultItem.body.filter(function (row) { return text_(row[0]); }).map(function (row) {
+    const person = personKey_(row[1], row[2], '旧結果');
+    const stage = text_(row[4]).startsWith('第2希望') ? 2 : 1;
+    if (!LOTTERY_SETTINGS.committees.includes(row[0])) throw new Error('旧結果の班名が不正です。');
+    return { key: person.key, committee: row[0], stage: stage };
+  });
+  const leaders = leaderItem.body.filter(function (row) { return text_(row[0]); }).map(function (row) {
+    const key = personKey_(row[1], row[2], '旧役職希望者').key;
+    const assignment = assignments.find(function (a) { return a.key === key && a.committee === row[0]; });
+    if (!assignment) throw new Error('旧役職希望者と旧結果が一致しません。');
+    return assignment;
+  });
+  const audit = auditItem.body.filter(function (row) { return text_(row[0]); }).map(function (row) {
+    return { sequence: Number(row[0]), type: row[1], detail: JSON.parse(row[2]) };
+  });
+  const acceptedAttempt = status === 'ACCEPTED' ? Number(meta['採用試行']) : null;
+  const record = {
+    schema: 'lottery-history/v1', runId: text_(meta['実行ID']), startedAt: text_(meta['実行開始日時']),
+    version: '1.0.0', algorithmVersion: '1.0.0', sourceRevision: 'legacy-1.0.0 (Git baseline 17c3cd72f5c677f762c2de15fc235edd5a116402)',
+    seed: text_(meta['シード']), status: status, acceptedAttempt: acceptedAttempt, attempts: Number(meta['実施試行数']),
+    responsesHash: text_(meta['元回答SHA256']), operationsHash: text_(meta['運営確認SHA256']),
+    resultHash: hashResult_(status, acceptedAttempt, assignments, leaders, digest),
+    auditHash: hashText_(JSON.stringify(audit), digest),
+    randomPosition: Number(meta['消費した乱数の個数']), finalRandomState: text_(meta['最終乱数状態'])
+  };
+  if (!validRunRecord_(record)) throw new Error('旧出力の再検証情報が不正です。');
+  return record;
+}
+
+function collectOutputRuns_(spreadsheet, protectedIds, digest) {
+  const groups = new Map(); const legacy = new Map(); const warnings = [];
+  spreadsheet.getSheets().forEach(function (sheet) {
+    if (protectedIds.has(sheet.getSheetId()) || !sheet.getName().startsWith(LOTTERY_SETTINGS.outputPrefix) ||
+        sheet.getName() === LOTTERY_HISTORY_NAME) return;
+    const note = readOutputNote_(sheet);
+    if (note && note.kind === 'output') {
+      if (!validRunRecord_(note.record) || !LOTTERY_OUTPUT_LABELS.includes(note.label)) {
+        throw new Error('出力シートの管理情報が不正です。自動削除せず確認してください。');
+      }
+      const id = note.record.runId;
+      if (!groups.has(id)) groups.set(id, { record: note.record, items: [], legacy: false });
+      const group = groups.get(id);
+      if (JSON.stringify(group.record) !== JSON.stringify(note.record)) throw new Error('出力間の管理情報が一致しません。');
+      group.items.push({ sheet: sheet, label: note.label });
+      return;
+    }
+    const old = legacyOutput_(sheet);
+    if (old) {
+      const id = text_(old.meta['実行ID']);
+      if (!legacy.has(id)) legacy.set(id, []);
+      legacy.get(id).push(old);
+    } else {
+      warnings.push('管理対象と確認できない出力名のシートを保持: ' + sheet.getName());
+    }
+  });
+  legacy.forEach(function (items, id) {
+    const record = legacyRecord_(items, digest);
+    if (!record) { warnings.push('6種類がそろわない、または未確定の旧出力を保持: ' + id); return; }
+    if (groups.has(id)) throw new Error('旧版と新版で実行IDが重複しています。');
+    groups.set(id, { record: record, items: items, legacy: true });
+  });
+  groups.forEach(function (group) {
+    if (new Set(group.items.map(function (item) { return item.label; })).size !== group.items.length) {
+      throw new Error('同一実行に同じ種類の出力が複数あります。複製したシートを保全したまま確認してください。');
+    }
+  });
+  return { groups: Array.from(groups.values()), warnings: warnings };
+}
+
+function moveOutputFront_(spreadsheet, items, status) {
+  const order = status === 'ACCEPTED' ? ['結果', '役職希望者', '実行情報'] : ['実行情報', '結果', '役職希望者'];
+  order.forEach(function (label, index) {
+    const item = items.find(function (entry) { return entry.label === label; });
+    if (item) { spreadsheet.setActiveSheet(item.sheet); spreadsheet.moveActiveSheet(index + 1); }
+  });
+  const first = items.find(function (item) { return item.label === order[0]; });
+  if (first) spreadsheet.setActiveSheet(first.sheet);
+}
+
+function formatOutput_(sheet, label, height, width) {
+  sheet.setFrozenRows(1);
+  const head = sheet.getRange(1, 1, 1, width);
+  head.setFontWeight('bold').setBackground('#1f4e78').setFontColor('#ffffff');
+  sheet.setRowHeight(1, 30);
+  for (let column = 1; column <= width; column += 1) sheet.setColumnWidth(column, 130);
+  if (label === '結果' || label === '役職希望者') {
+    sheet.setColumnWidth(1, 180); sheet.setColumnWidth(2, 70); sheet.setColumnWidth(3, 80); sheet.setColumnWidth(4, 160);
+    if (height > 1) sheet.getRange(1, 1, height, width).createFilter();
+  } else if (label === '実行情報') {
+    sheet.setColumnWidth(1, 220); sheet.setColumnWidth(2, 560);
+  } else {
+    sheet.setColumnWidth(width, 460);
+  }
+  const clip = typeof SpreadsheetApp !== 'undefined' && SpreadsheetApp.WrapStrategy ? SpreadsheetApp.WrapStrategy.CLIP : 'CLIP';
+  sheet.getRange(1, 1, Math.max(height, 1), width).setWrapStrategy(clip);
+}
+
+function assertUnchangedInputs_(record, groups, history) {
+  groups.map(function (group) { return group.record; }).concat(history.map(function (entry) { return entry.record; }))
+    .forEach(function (old) {
+      if (old.responsesHash !== record.responsesHash || old.operationsHash !== record.operationsHash) {
+        throw new Error('元回答または運営確認が過去の実行から変わっています。過去を再検証できるよう旧入力を保管するまで、旧出力の整理を停止します。');
+      }
+    });
+}
+
+function writeOutputPlans_(spreadsheet, plans, runId, status, flush, options) {
+  flush = flush || function () {};
+  options = options || {};
+  const protectedIds = new Set(options.protectedIds || []);
+  const history = historyRows_(spreadsheet.getSheetByName(LOTTERY_HISTORY_NAME));
+  const inventory = collectOutputRuns_(spreadsheet, protectedIds, options.digest);
+  let record = Object.assign({}, plans[0].record);
+  assertUnchangedInputs_(record, inventory.groups, history);
+  const usedIds = new Set(history.map(function (entry) { return entry.record.runId; })
+    .concat(inventory.groups.map(function (group) { return group.record.runId; })));
+  let suffix = 1;
+  while (usedIds.has(record.runId)) record.runId = runId + '_' + suffix++;
+  const oldSheets = inventory.groups.flatMap(function (group) { return group.items.map(function (item) { return item.sheet; }); });
+  const oldIds = new Set(oldSheets.map(function (sheet) { return sheet.getSheetId(); }));
+  LOTTERY_OUTPUT_LABELS.forEach(function (label) {
+    const existing = spreadsheet.getSheetByName(LOTTERY_SETTINGS.outputPrefix + label);
+    if (existing && !oldIds.has(existing.getSheetId())) throw new Error('固定の出力名が管理対象外シートと衝突しています: ' + label);
+  });
+  const prepared = plans.map(function (plan) {
+    const width = Math.max.apply(null, plan.rows.map(function (row) { return row.length; }));
+    const rows = plan.rows.map(function (row) {
+      const values = row.map(safeCell_);
+      if (plan.label === '実行情報' && row[0] === '実行ID') values[1] = record.runId;
+      while (values.length < width) values.push('');
+      values.forEach(function (value) {
+        if (typeof value === 'string' && value.length > 45000) throw new Error('入力またはログが1セルの保存上限を超えます。');
+      });
+      return values;
+    });
+    return { label: plan.label, rows: rows, width: width,
+      temporaryName: LOTTERY_SETTINGS.outputPrefix + '保存中_' + record.runId + '_' + plan.label };
+  });
+  const created = []; const renamedOld = []; const renamedNew = [];
+  let published = false;
   try {
-    preparedPlans.forEach(function (plan) {
-      const sheet = spreadsheet.insertSheet(plan.name);
-      created.push(sheet);
+    prepared.forEach(function (plan) {
+      const sheet = spreadsheet.insertSheet(plan.temporaryName);
+      created.push({ sheet: sheet, plan: plan });
+      sheet.hideSheet();
+      sheet.getRange(1, 1).setNote(JSON.stringify({ owner: LOTTERY_OUTPUT_OWNER, kind: 'output',
+        schema: 2, label: plan.label, phase: 'staging', record: record }));
       if (sheet.getMaxRows() < plan.rows.length) sheet.insertRowsAfter(sheet.getMaxRows(), plan.rows.length - sheet.getMaxRows());
       if (sheet.getMaxColumns() < plan.width) sheet.insertColumnsAfter(sheet.getMaxColumns(), plan.width - sheet.getMaxColumns());
       for (let offset = 0; offset < plan.rows.length; offset += 500) {
         const chunk = plan.rows.slice(offset, offset + 500);
-        const range = sheet.getRange(offset + 1, 1, chunk.length, plan.width);
-        range.setNumberFormat('@'); range.setValues(chunk);
+        sheet.getRange(offset + 1, 1, chunk.length, plan.width).setNumberFormat('@').setValues(chunk);
       }
-      sheet.setFrozenRows(2);
+      formatOutput_(sheet, plan.label, plan.rows.length, plan.width);
     });
     flush();
-    // 結果シートの状態を最後に確定する。他の出力が欠けた状態を成立として扱わない。
-    for (let i = 1; i < created.length; i += 1) created[i].getRange(2, 2).setValue(displayStatus_(status));
+    const entries = inventory.groups.filter(function (group) {
+      return !history.some(function (entry) { return entry.record.runId === group.record.runId; });
+    }).map(function (group) { return { event: group.legacy ? '旧版移行' : '旧出力記録', record: group.record }; });
+    entries.push({ event: '保存準備', record: record });
+    appendHistory_(spreadsheet, entries); flush();
+    oldSheets.forEach(function (sheet) {
+      const oldName = sheet.getName();
+      if (LOTTERY_OUTPUT_LABELS.some(function (label) { return oldName === LOTTERY_SETTINGS.outputPrefix + label; })) {
+        let replacement = LOTTERY_SETTINGS.outputPrefix + '退避_' + sheet.getSheetId() + '_' + record.runId;
+        while (spreadsheet.getSheetByName(replacement)) replacement += '_';
+        sheet.setName(replacement); renamedOld.push({ sheet: sheet, name: oldName });
+      }
+    });
+    created.forEach(function (item) {
+      item.sheet.setName(LOTTERY_SETTINGS.outputPrefix + item.plan.label); renamedNew.push(item);
+      markOutput_(item.sheet, item.plan.label, record, 'staging');
+    });
     flush();
-    created[0].getRange(2, 2).setValue(displayStatus_(status));
-    flush();
+    created.filter(function (item) { return item.plan.label !== '実行情報'; }).forEach(function (item) {
+      markOutput_(item.sheet, item.plan.label, record, 'published');
+    });
+    const summary = created.find(function (item) { return item.plan.label === '実行情報'; });
+    markOutput_(summary.sheet, summary.plan.label, record, 'published'); flush();
+    created.forEach(function (item) { item.sheet.showSheet(); });
+    moveOutputFront_(spreadsheet, created.map(function (item) { return { sheet: item.sheet, label: item.plan.label }; }), status);
+    appendHistory_(spreadsheet, [{ event: '保存完了', record: record }]); flush();
+    published = true;
   } catch (error) {
-    created.forEach(function (sheet) {
-      try { sheet.getRange(2, 2).setValue('出力失敗・当選未確定'); } catch (ignored) { /* 元の例外を保持する */ }
+    renamedNew.slice().reverse().forEach(function (item) {
+      try { item.sheet.setName(item.plan.temporaryName); } catch (ignored) { /* 旧出力を削除しない */ }
     });
-    try { flush(); } catch (ignored) { /* 元の例外を保持する */ }
-    throw new Error('出力の保存に失敗しました。作成済みシートは削除せず残しました。当選結果として使用しないでください。');
+    renamedOld.slice().reverse().forEach(function (item) {
+      try { item.sheet.setName(item.name); } catch (ignored) { /* 退避状態を保持 */ }
+    });
+    created.forEach(function (item) {
+      try { markOutput_(item.sheet, item.plan.label, record, 'failed'); item.sheet.showSheet(); } catch (ignored) { /* 原因を保持 */ }
+    });
+    try {
+      const oldFront = LOTTERY_OUTPUT_LABELS.map(function (label) {
+        return { label: label, sheet: spreadsheet.getSheetByName(LOTTERY_SETTINGS.outputPrefix + label) };
+      }).filter(function (item) { return item.sheet && oldIds.has(item.sheet.getSheetId()); });
+      if (oldFront.length) moveOutputFront_(spreadsheet, oldFront, readOutputNote_(oldFront[0].sheet).record.status);
+    } catch (ignored) { /* 旧出力は保持したまま、元の保存エラーを伝える */ }
+    try { appendHistory_(spreadsheet, [{ event: '保存失敗', record: record }]); flush(); } catch (ignored) { /* 旧出力を保持 */ }
+    throw new Error('出力の保存に失敗しました。旧出力は削除していません。保存中・出力失敗のシートを当選結果として使用しないでください。');
   }
-  return { runId: uniqueId, sheetNames: created.map(function (sheet) { return sheet.getName(); }) };
+  const warnings = inventory.warnings.slice();
+  if (published) {
+    oldSheets.forEach(function (sheet) {
+      if (protectedIds.has(sheet.getSheetId()) || !oldIds.has(sheet.getSheetId())) throw new Error('入力シートは削除できません。');
+      try { spreadsheet.deleteSheet(sheet); } catch (error) { warnings.push('旧出力を削除できず保持: ' + sheet.getName()); }
+    });
+  }
+  return { runId: record.runId, sheetNames: created.map(function (item) { return item.sheet.getName(); }), warnings: warnings };
 }
 
 function executeLotteryOnSpreadsheet_(spreadsheet, options) {
   const captured = readInputSheets_(spreadsheet);
   const result = runLotteryEngine_(captured.responses.data, captured.operations.data,
     { seed: options.seed, digest: options.digest, locations: captured });
-  const plans = buildOutputPlans_(captured, result, options);
-  const output = writeOutputPlans_(spreadsheet, plans, options.runId, result.status, options.flush);
+  const context = Object.assign({}, options);
+  context.record = makeRunRecord_(captured, result, context);
+  const plans = buildOutputPlans_(captured, result, context);
+  const output = writeOutputPlans_(spreadsheet, plans, options.runId, result.status, options.flush, {
+    digest: options.digest, protectedIds: [captured.responses.id, captured.operations.id]
+  });
   return {
-    status: result.status, runId: output.runId, sheetNames: output.sheetNames,
+    status: result.status, runId: output.runId, sheetNames: output.sheetNames, warnings: output.warnings,
     acceptedAttempt: result.acceptedAttempt, attempts: result.attempts.length,
     applicants: result.prepared.candidates.length, eligible: result.prepared.eligible.length,
     selected: result.assignments.length
   };
 }
 
+function verifyHistoryEntries_(captured, entries, digest) {
+  const responsesHash = snapshotHash_(captured.responses.values, digest);
+  const operationsHash = snapshotHash_(captured.operations.values, digest);
+  const records = new Map();
+  const failed = new Set(entries.filter(function (entry) { return entry.event === '保存失敗'; })
+    .map(function (entry) { return entry.record.runId; }));
+  entries.filter(function (entry) {
+    return !failed.has(entry.record.runId) && (entry.event === '保存完了' || entry.event === '旧版移行');
+  })
+    .forEach(function (entry) { records.set(entry.record.runId, entry.record); });
+  const cache = new Map();
+  return Array.from(records.values()).map(function (record) {
+    if (record.responsesHash !== responsesHash || record.operationsHash !== operationsHash) {
+      return { runId: record.runId, verification: '入力が当時と異なる' };
+    }
+    if (record.algorithmVersion !== LOTTERY_ALGORITHM_VERSION) {
+      return { runId: record.runId, verification: '当時のプログラムでの確認が必要' };
+    }
+    if (!cache.has(record.seed)) {
+      const result = runLotteryEngine_(captured.responses.data, captured.operations.data,
+        { seed: record.seed, digest: digest, locations: captured });
+      cache.set(record.seed, makeRunRecord_(captured, result, { runId: record.runId, startedAt: record.startedAt, digest: digest }));
+    }
+    const regenerated = cache.get(record.seed);
+    return { runId: record.runId, verification: record.resultHash === regenerated.resultHash &&
+      record.auditHash === regenerated.auditHash ? '一致' : '結果または全試行ログが不一致' };
+  });
+}
+
+function verifyLotteryHistory() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const captured = readInputSheets_(spreadsheet);
+  const checked = verifyHistoryEntries_(captured, historyRows_(spreadsheet.getSheetByName(LOTTERY_HISTORY_NAME)));
+  const matched = checked.filter(function (item) { return item.verification === '一致'; }).length;
+  SpreadsheetApp.getUi().alert('実行履歴の照合（書込なし）',
+    '保存済み実行 ' + checked.length + '件／一致 ' + matched + '件\n' +
+    checked.filter(function (item) { return item.verification !== '一致'; }).map(function (item) {
+      return item.runId + ': ' + item.verification;
+    }).join('\n'), SpreadsheetApp.getUi().ButtonSet.OK);
+  return checked;
+}
+
 // Node.js組み込みテスト用。Apps Scriptではmoduleが存在せず、この分岐は実行されない。
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    LOTTERY_SEED, LOTTERY_VERSION, LOTTERY_PRNG, LOTTERY_SETTINGS,
+    LOTTERY_SEED, LOTTERY_VERSION, LOTTERY_ALGORITHM_VERSION, LOTTERY_PRNG, LOTTERY_SETTINGS,
+    LOTTERY_OUTPUT_OWNER, LOTTERY_HISTORY_HEADER, LOTTERY_HISTORY_NAME,
     personKey_, prepareLotteryInput_, checkPossible_, maximumClassCoverage_, utf8Bytes_, hashText_,
     createRandom_, runLotteryEngine_, readInputSheets_, buildOutputPlans_, writeOutputPlans_,
-    executeLotteryOnSpreadsheet_, safeCell_, serializedRow_
+    executeLotteryOnSpreadsheet_, safeCell_, serializedRow_, makeRunRecord_, hashResult_,
+    historyRows_, collectOutputRuns_, verifyHistoryEntries_, readOutputNote_
   };
 }

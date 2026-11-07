@@ -46,6 +46,15 @@ test('SHA-256 chain and UTF-8 encoding agree with the independent Node crypto im
   assert.equal(lottery.hashText_(text, digest), crypto.createHash('sha256').update(text).digest('hex'));
 });
 
+test('presentation changes preserve the version 1.0 deterministic audit trace', () => {
+  const data = balanced();
+  const extra = response('A組', 90, '特に希望なし', { chair: false, second: roles[1], meetings: '参加できます' });
+  data.push(extra);
+  const result = engine(data);
+  assert.equal(crypto.createHash('sha256').update(JSON.stringify(result.audit)).digest('hex'),
+    '41bb13fc68eb788fdf6908b94eea9a9ad3cf6265bf30293abdac46140538a516');
+});
+
 test('integer conversion rejects the modulo-biased tail and records the discarded word', () => {
   const words = [0xffffffff, 8];
   const events = [];
@@ -272,7 +281,14 @@ class FakeRange {
       clone(this.sheet.values[this.row - 1 + y]?.[this.column - 1 + x] ?? '')));
   }
   getA1Notation() { return `A1:N${this.height}`; }
+  getNote() { return this.sheet.notes[`${this.row}:${this.column}`] || ''; }
+  setNote(value) { this.sheet.writable(); this.sheet.notes[`${this.row}:${this.column}`] = value; return this; }
   setNumberFormat() { this.sheet.writable(); return this; }
+  setFontWeight() { this.sheet.writable(); return this; }
+  setBackground() { this.sheet.writable(); return this; }
+  setFontColor() { this.sheet.writable(); return this; }
+  setWrapStrategy() { this.sheet.writable(); return this; }
+  createFilter() { this.sheet.writable(); this.sheet.filter = true; return this; }
   setValues(values) {
     this.sheet.writable();
     if (++this.sheet.owner.writes === this.sheet.owner.failWriteAt) throw Error('simulated write failure');
@@ -291,7 +307,7 @@ class FakeRange {
 }
 class FakeSheet {
   constructor(owner, name, values, input = false) {
-    Object.assign(this, { owner, name, values: clone(values), input, id: ++owner.nextId, rows: 1000, columns: 26 });
+    Object.assign(this, { owner, name, values: clone(values), input, id: ++owner.nextId, rows: 1000, columns: 26, notes: {} });
   }
   getName() { return this.name; }
   getSheetId() { return this.id; }
@@ -302,11 +318,25 @@ class FakeSheet {
   writable() { assert.ok(!this.input, 'input sheet must never be mutated'); }
   insertRowsAfter(after, count) { this.writable(); this.rows += count; }
   insertColumnsAfter(after, count) { this.writable(); this.columns += count; }
-  setFrozenRows() { this.writable(); }
+  setFrozenRows(count) { this.writable(); this.frozenRows = count; }
+  setColumnWidth() { this.writable(); }
+  setRowHeight() { this.writable(); }
+  getLastRow() {
+    for (let i = this.values.length - 1; i >= 0; i--) if (this.values[i].some(v => v !== '' && v != null)) return i + 1;
+    return 0;
+  }
+  hideSheet() { this.writable(); this.hidden = true; }
+  showSheet() { this.writable(); this.hidden = false; }
+  setName(name) {
+    this.writable();
+    if (++this.owner.renames === this.owner.failRenameAt) throw Error('simulated rename failure');
+    assert.ok(!this.owner.getSheetByName(name) || this.owner.getSheetByName(name) === this);
+    this.name = name; return this;
+  }
 }
 class FakeSpreadsheet {
   constructor(data = balanced(), ops = operations()) {
-    this.nextId = 0; this.writes = 0;
+    this.nextId = 0; this.writes = 0; this.renames = 0;
     this.sheets = [new FakeSheet(this, 'フォームの回答 1', data, true), new FakeSheet(this, '運営確認', ops, true)];
   }
   getId() { return 'fixture-spreadsheet'; }
@@ -316,6 +346,13 @@ class FakeSpreadsheet {
   insertSheet(name) {
     assert.ok(!this.getSheetByName(name), 'must not overwrite existing sheets');
     const sheet = new FakeSheet(this, name, []); this.sheets.push(sheet); return sheet;
+  }
+  deleteSheet(sheet) { sheet.writable(); this.sheets.splice(this.sheets.indexOf(sheet), 1); sheet.deleted = true; }
+  setActiveSheet(sheet) { sheet.writable(); this.activeSheet = sheet; }
+  moveActiveSheet(position) {
+    this.activeSheet.writable();
+    this.sheets.splice(this.sheets.indexOf(this.activeSheet), 1);
+    this.sheets.splice(position - 1, 0, this.activeSheet);
   }
 }
 const runOptions = { seed: lottery.LOTTERY_SEED, digest, runId: 'fixture-run', startedAt: '2026-01-01T00:00:00.000Z' };
@@ -337,27 +374,206 @@ test('operations headers may have a title above them; ambiguous or missing input
   assert.equal(missing.writes, 0);
 });
 
-test('adapter writes six fresh sheets, captures input, escapes formulas and preserves prior outputs and inputs', () => {
+test('latest tables are at the front, have fixed names and preserve inputs while compact history is append-only', () => {
   const data = balanced(); data[1][2] = '=1+1';
   const spreadsheet = new FakeSpreadsheet(data);
   const original = clone(spreadsheet.sheets.map(s => s.values));
   const first = lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
   assert.equal(first.status, 'ACCEPTED');
-  assert.equal(first.sheetNames.length, 6);
-  assert.deepEqual(spreadsheet.sheets.slice(0, 2).map(s => s.values), original);
-  const outputs = spreadsheet.sheets.slice(2);
-  assert.ok(outputs.every(s => s.values[1][1] === '成立'));
+  assert.equal(first.sheetNames.length, 7);
+  assert.deepEqual(spreadsheet.sheets.filter(s => s.input).map(s => s.values), original);
+  const outputs = spreadsheet.sheets.filter(s => lottery.readOutputNote_(s)?.kind === 'output');
+  assert.ok(outputs.every(s => lottery.readOutputNote_(s).phase === 'published'));
+  assert.deepEqual(spreadsheet.sheets.slice(0, 3).map(s => s.name), ['抽選_結果', '抽選_役職希望者', '抽選_実行情報']);
   const result = outputs.find(s => s.name.endsWith('_結果'));
   assert.ok(result.values.some(r => r.includes("'=1+1")));
   const leaders = outputs.find(s => s.name.endsWith('_役職希望者'));
-  assert.equal(leaders.values.slice(17).length, 25);
+  assert.equal(result.values[0][0], '班');
+  assert.equal(result.values.length, 26);
+  assert.equal(result.frozenRows, 1);
+  assert.ok(result.filter);
+  assert.equal(leaders.values.slice(1).length, 25);
   const snapshot = outputs.find(s => s.name.endsWith('_入力控え'));
-  assert.equal(snapshot.values.slice(17).length, data.length + 1);
+  assert.equal(snapshot.values.slice(1).length, data.length + 1);
+  const historySheet = spreadsheet.getSheetByName(lottery.LOTTERY_HISTORY_NAME);
+  const previousHistory = clone(historySheet.values);
   const saved = clone(outputs.map(s => s.values));
   const second = lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
   assert.equal(second.runId, 'fixture-run_1');
-  assert.equal(spreadsheet.sheets.length, 14);
+  assert.equal(spreadsheet.sheets.length, 10);
+  assert.ok(outputs.every(s => s.deleted));
   assert.deepEqual(outputs.map(s => s.values), saved);
+  assert.deepEqual(historySheet.values.slice(0, previousHistory.length), previousHistory);
+  assert.ok(!JSON.stringify(historySheet.values).includes('架空'));
+  const entries = lottery.historyRows_(historySheet);
+  assert.equal(entries.filter(e => e.event === '保存完了').length, 2);
+  const checked = lottery.verifyHistoryEntries_(lottery.readInputSheets_(spreadsheet), entries, digest);
+  assert.deepEqual(checked.map(c => c.verification), ['一致', '一致']);
+});
+
+function legacyRun(spreadsheet, id = 'legacy-run') {
+  const captured = lottery.readInputSheets_(spreadsheet);
+  const result = engine(captured.responses.data, captured.operations.data);
+  const record = lottery.makeRunRecord_(captured, result, { ...runOptions, runId: id });
+  const metadata = [
+    ['実行ID', id], ['状態', result.status === 'ACCEPTED' ? '成立' : '試行上限到達・選出未成立'],
+    ['方式の版', '1.0.0'], ['シード', record.seed], ['乱数方式', lottery.LOTTERY_PRNG],
+    ['元回答SHA256', record.responsesHash], ['運営確認SHA256', record.operationsHash],
+    ['採用試行', result.acceptedAttempt || 'なし'], ['実施試行数', result.attempts.length],
+    ['消費した乱数の個数', result.randomPosition], ['最終乱数状態', result.finalRandomState],
+    ['実行開始日時', record.startedAt], ['タイムゾーン', captured.timezone],
+    ['元回答シート・範囲', captured.responses.name + '!' + captured.responses.range],
+    ['運営確認シート・範囲', captured.operations.name + '!' + captured.operations.range]
+  ];
+  const sheets = lottery.buildOutputPlans_(captured, result, runOptions).filter(p => p.label !== '実行情報').map(plan => {
+    const sheet = new FakeSheet(spreadsheet, `抽選_${id}_${plan.label}`, [...metadata, [], ...plan.rows]);
+    spreadsheet.sheets.push(sheet);
+    return sheet;
+  });
+  return sheets;
+}
+
+test('complete legacy runs are recorded with reproducible hashes before their six output sheets are removed', () => {
+  const spreadsheet = new FakeSpreadsheet();
+  const old = legacyRun(spreadsheet);
+  const summary = lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+  assert.equal(summary.warnings.length, 0);
+  assert.ok(old.every(s => s.deleted));
+  assert.equal(spreadsheet.sheets.length, 10);
+  const entries = lottery.historyRows_(spreadsheet.getSheetByName(lottery.LOTTERY_HISTORY_NAME));
+  assert.equal(entries.filter(e => e.event === '旧版移行').length, 1);
+  assert.deepEqual(lottery.verifyHistoryEntries_(lottery.readInputSheets_(spreadsheet), entries, digest)
+    .map(item => item.verification), ['一致', '一致']);
+});
+
+test('incomplete legacy output sets are preserved with a warning', () => {
+  const spreadsheet = new FakeSpreadsheet();
+  const old = legacyRun(spreadsheet);
+  spreadsheet.deleteSheet(old.pop());
+  const summary = lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+  assert.ok(old.every(sheet => spreadsheet.sheets.includes(sheet)));
+  assert.ok(summary.warnings.some(warning => warning.includes('6種類がそろわない')));
+  assert.equal(lottery.historyRows_(spreadsheet.getSheetByName(lottery.LOTTERY_HISTORY_NAME))
+    .filter(entry => entry.event === '旧版移行').length, 0);
+});
+
+test('old-output cleanup failure keeps the newly saved tables and is recovered on the next run', () => {
+  const spreadsheet = new FakeSpreadsheet();
+  lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+  const old = spreadsheet.getSheetByName('抽選_結果');
+  const remove = spreadsheet.deleteSheet.bind(spreadsheet);
+  spreadsheet.deleteSheet = sheet => { if (sheet === old) throw Error('simulated cleanup failure'); remove(sheet); };
+  const summary = lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+  assert.equal(summary.status, 'ACCEPTED');
+  assert.equal(summary.warnings.length, 1);
+  assert.ok(spreadsheet.sheets.includes(old));
+  assert.notEqual(spreadsheet.getSheetByName('抽選_結果'), old);
+  assert.equal(spreadsheet.sheets[0].name, '抽選_結果');
+  spreadsheet.deleteSheet = remove;
+  lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+  assert.ok(old.deleted);
+  assert.equal(spreadsheet.sheets.length, 10);
+});
+
+test('changed answers or operations halt replacement before any prior output or history is modified', () => {
+  for (const kind of ['answers', 'operations']) {
+    const spreadsheet = new FakeSpreadsheet();
+    lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+    const outputs = spreadsheet.sheets.filter(s => !s.input);
+    const previous = clone(outputs.map(s => ({ id: s.id, name: s.name, values: s.values, notes: s.notes })));
+    if (kind === 'answers') spreadsheet.sheets.find(s => s.input && s.name !== '運営確認').values[1][12] = '変更された回答';
+    else spreadsheet.getSheetByName('運営確認').values.push(['A組', 1, '', '', '', '変更された運営記録']);
+    const writes = spreadsheet.writes;
+    assert.throws(() => lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions), /過去の実行から変わっています/);
+    assert.equal(spreadsheet.writes, writes);
+    assert.deepEqual(outputs.map(s => ({ id: s.id, name: s.name, values: s.values, notes: s.notes })), previous);
+    assert.ok(outputs.every(s => !s.deleted));
+  }
+});
+
+test('unrelated sheets with output-like names are preserved and reserved-name collisions are rejected', () => {
+  const spreadsheet = new FakeSpreadsheet();
+  const unrelated = new FakeSheet(spreadsheet, '抽選_私用メモ', [['keep me']]);
+  spreadsheet.sheets.push(unrelated);
+  const summary = lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+  assert.ok(summary.warnings.length);
+  assert.ok(spreadsheet.sheets.includes(unrelated));
+  assert.deepEqual(unrelated.values, [['keep me']]);
+  const collision = new FakeSpreadsheet();
+  collision.sheets.push(new FakeSheet(collision, '抽選_結果', [['user-owned']]));
+  assert.throws(() => lottery.executeLotteryOnSpreadsheet_(collision, runOptions), /管理対象外シートと衝突/);
+  assert.equal(collision.writes, 0);
+});
+
+test('a rename failure restores the previous latest set; the next successful run cleans only managed failed outputs', () => {
+  const spreadsheet = new FakeSpreadsheet();
+  lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+  const old = spreadsheet.sheets.filter(s => lottery.readOutputNote_(s)?.kind === 'output');
+  const saved = clone(old.map(s => ({ name: s.name, values: s.values })));
+  spreadsheet.failRenameAt = spreadsheet.renames + 10;
+  assert.throws(() => lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions), /旧出力は削除していません/);
+  assert.ok(old.every(s => !s.deleted));
+  assert.deepEqual(old.map(s => ({ name: s.name, values: s.values })), saved);
+  spreadsheet.failRenameAt = undefined;
+  const summary = lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+  assert.equal(summary.runId, 'fixture-run_2');
+  assert.equal(spreadsheet.sheets.length, 10);
+  assert.ok(old.every(s => s.deleted));
+  const history = lottery.historyRows_(spreadsheet.getSheetByName(lottery.LOTTERY_HISTORY_NAME));
+  assert.ok(history.some(e => e.event === '保存失敗'));
+});
+
+test('failure to append the new history record never deletes or renames previous latest outputs', () => {
+  const spreadsheet = new FakeSpreadsheet();
+  lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+  const old = spreadsheet.sheets.filter(s => lottery.readOutputNote_(s)?.kind === 'output');
+  const saved = clone(old.map(s => ({ name: s.name, values: s.values })));
+  spreadsheet.failWriteAt = spreadsheet.writes + 8; // 7 new tables, then append-only history.
+  assert.throws(() => lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions), /旧出力は削除していません/);
+  assert.ok(old.every(s => !s.deleted));
+  assert.deepEqual(old.map(s => ({ name: s.name, values: s.values })), saved);
+});
+
+test('a final flush failure overrides a saved completion event and restores previous latest tables to the front', () => {
+  const spreadsheet = new FakeSpreadsheet();
+  lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+  const oldResult = spreadsheet.getSheetByName('抽選_結果');
+  let flushes = 0;
+  assert.throws(() => lottery.executeLotteryOnSpreadsheet_(spreadsheet, {
+    ...runOptions, flush() { if (++flushes === 5) throw Error('final flush failed'); }
+  }), /旧出力は削除していません/);
+  assert.equal(spreadsheet.getSheetByName('抽選_結果'), oldResult);
+  assert.equal(spreadsheet.sheets[0], oldResult);
+  const entries = lottery.historyRows_(spreadsheet.getSheetByName(lottery.LOTTERY_HISTORY_NAME));
+  assert.ok(entries.some(e => e.record.runId === 'fixture-run_1' && e.event === '保存完了'));
+  assert.ok(entries.some(e => e.record.runId === 'fixture-run_1' && e.event === '保存失敗'));
+  assert.deepEqual(lottery.verifyHistoryEntries_(lottery.readInputSheets_(spreadsheet), entries, digest)
+    .map(item => item.runId), ['fixture-run']);
+});
+
+test('user-made duplicates of managed outputs are not silently deleted', () => {
+  const spreadsheet = new FakeSpreadsheet();
+  lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+  const result = spreadsheet.getSheetByName('抽選_結果');
+  const duplicate = new FakeSheet(spreadsheet, '抽選_結果のコピー', result.values);
+  duplicate.notes = clone(result.notes); spreadsheet.sheets.push(duplicate);
+  assert.throws(() => lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions), /同じ種類の出力が複数/);
+  assert.ok(spreadsheet.sheets.includes(result));
+  assert.ok(spreadsheet.sheets.includes(duplicate));
+});
+
+test('read-only replay detects mismatching hashes and changed input without modifying sheets', () => {
+  const spreadsheet = new FakeSpreadsheet();
+  lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+  const captured = lottery.readInputSheets_(spreadsheet);
+  const entries = lottery.historyRows_(spreadsheet.getSheetByName(lottery.LOTTERY_HISTORY_NAME));
+  const altered = clone(entries);
+  altered.find(e => e.event === '保存完了').record.auditHash = '00'.repeat(32);
+  const writes = spreadsheet.writes;
+  assert.equal(lottery.verifyHistoryEntries_(captured, altered, digest)[0].verification, '結果または全試行ログが不一致');
+  captured.operations.values.push(['A組', 1, '', '', '', 'changed']);
+  assert.equal(lottery.verifyHistoryEntries_(captured, entries, digest)[0].verification, '入力が当時と異なる');
+  assert.equal(spreadsheet.writes, writes);
 });
 
 test('unsuccessful attempts leave result and leadership output empty while preserving all attempt statistics', () => {
@@ -366,11 +582,13 @@ test('unsuccessful attempts leave result and leadership output empty while prese
   assert.equal(summary.status, 'ATTEMPT_LIMIT_REACHED');
   for (const suffix of ['_結果', '_役職希望者']) {
     const sheet = spreadsheet.sheets.find(s => s.name.endsWith(suffix));
-    assert.equal(sheet.values.slice(17).length, 0);
-    assert.equal(sheet.values[1][1], '試行上限到達・選出未成立');
+    assert.equal(sheet.values.slice(1).length, 0);
+    assert.equal(lottery.readOutputNote_(sheet).record.status, 'ATTEMPT_LIMIT_REACHED');
   }
+  assert.equal(spreadsheet.sheets[0].name, '抽選_実行情報');
+  assert.equal(spreadsheet.getSheetByName('抽選_実行情報').values[2][1], '試行上限到達・選出未成立');
   const stats = spreadsheet.sheets.find(s => s.name.endsWith('_結果統計'));
-  assert.deepEqual([...new Set(stats.values.slice(17).map(r => r[0]))], [1, 2, 3, 4, 5, 6]);
+  assert.deepEqual([...new Set(stats.values.slice(1).map(r => r[0]))], [1, 2, 3, 4, 5, 6]);
 });
 
 test('input validation writes nothing; partial output failure is retained and marked unconfirmed', () => {
@@ -381,9 +599,10 @@ test('input validation writes nothing; partial output failure is retained and ma
   const spreadsheet = new FakeSpreadsheet(); spreadsheet.failWriteAt = 2;
   const original = clone(spreadsheet.sheets.map(s => s.values));
   assert.throws(() => lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions), /出力の保存に失敗/);
-  assert.equal(spreadsheet.sheets.length, 4);
-  assert.deepEqual(spreadsheet.sheets.slice(0, 2).map(s => s.values), original);
-  assert.ok(spreadsheet.sheets.slice(2).every(s => s.values[1][1] === '出力失敗・当選未確定'));
+  assert.equal(spreadsheet.sheets.length, 5);
+  assert.deepEqual(spreadsheet.sheets.filter(s => s.input).map(s => s.values), original);
+  assert.ok(spreadsheet.sheets.filter(s => lottery.readOutputNote_(s)?.kind === 'output')
+    .every(s => lottery.readOutputNote_(s).phase === 'failed'));
 });
 
 test('menu setup and the legacy preview entry do not run lotteries or modify sheets', () => {
@@ -408,7 +627,8 @@ test('buffered output failure cannot confirm winners', () => {
   assert.throws(() => lottery.executeLotteryOnSpreadsheet_(spreadsheet, {
     ...runOptions, flush() { if (++calls === 1) throw Error('simulated buffered failure'); }
   }), /出力の保存に失敗/);
-  assert.ok(spreadsheet.sheets.slice(2).every(s => s.values[1][1] === '出力失敗・当選未確定'));
+  assert.ok(spreadsheet.sheets.filter(s => lottery.readOutputNote_(s)?.kind === 'output')
+    .every(s => lottery.readOutputNote_(s).phase === 'failed'));
 });
 
 test('Apps Script entry point uses signed digest bytes, flushes outputs and releases the document lock', () => {
@@ -417,6 +637,7 @@ test('Apps Script entry point uses signed digest bytes, flushes outputs and rele
   spreadsheet.toast = (...args) => notifications.push(args);
   let releases = 0, flushes = 0;
   const context = {
+    LOTTERY_BUILD_REVISION: '1'.repeat(40),
     SpreadsheetApp: { getActiveSpreadsheet: () => spreadsheet, flush: () => { flushes++; } },
     LockService: { getDocumentLock: () => ({ tryLock: () => true, releaseLock: () => { releases++; } }) },
     Utilities: {
@@ -435,11 +656,13 @@ test('Apps Script entry point uses signed digest bytes, flushes outputs and rele
   assert.equal(summary.status, 'ACCEPTED');
   assert.equal(summary.selected, 25);
   assert.equal(releases, 1);
-  assert.equal(flushes, 3);
+  assert.equal(flushes, 5);
   assert.equal(notifications.length, 1);
+  const saved = lottery.historyRows_(spreadsheet.getSheetByName(lottery.LOTTERY_HISTORY_NAME));
+  assert.equal(saved.find(entry => entry.event === '保存完了').record.sourceRevision, '1'.repeat(40));
   const denied = { ...context, LockService: { getDocumentLock: () => ({ tryLock: () => false }) } };
   vm.createContext(denied);
   vm.runInContext(fs.readFileSync(require.resolve('../apps-script/CommitteeLottery.js'), 'utf8'), denied);
   assert.throws(() => denied.runCommitteeLottery(), /別の抽選処理/);
-  assert.equal(spreadsheet.sheets.length, 8);
+  assert.equal(spreadsheet.sheets.length, 10);
 });
