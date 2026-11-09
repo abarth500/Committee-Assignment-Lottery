@@ -486,11 +486,121 @@ test('changed answers or operations halt replacement before any prior output or 
     if (kind === 'answers') spreadsheet.sheets.find(s => s.input && s.name !== '運営確認').values[1][12] = '変更された回答';
     else spreadsheet.getSheetByName('運営確認').values.push(['A組', 1, '', '', '', '変更された運営記録']);
     const writes = spreadsheet.writes;
-    assert.throws(() => lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions), /過去の実行から変わっています/);
+    assert.throws(() => lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions), error => {
+      assert.match(error.message, /過去の実行から変わっています/);
+      if (kind === 'answers') {
+        assert.match(error.message, /「フォームの回答 1」2行目 M2/);
+        assert.match(error.message, /【質問10】自由記述/);
+        assert.match(error.message, /""（文字列） → "変更された回答"（文字列）/);
+      } else {
+        assert.match(error.message, /「運営確認」2行目 F2/);
+        assert.match(error.message, /メモ/);
+        assert.match(error.message, /追加: （セルなし） → "変更された運営記録"（文字列）/);
+      }
+      return true;
+    });
     assert.equal(spreadsheet.writes, writes);
     assert.deepEqual(outputs.map(s => ({ id: s.id, name: s.name, values: s.values, notes: s.notes })), previous);
     assert.ok(outputs.every(s => !s.deleted));
   }
+});
+
+test('input-change errors show both sheets, dates, value types and the actual operations header row', () => {
+  const data = balanced();
+  data[1][0] = new Date('2026-01-01T00:00:00.000Z');
+  const ops = [['運営追記'], ...operations([['A組', 1, '', '', '', '以前のメモ']])];
+  const spreadsheet = new FakeSpreadsheet(data, ops);
+  lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+  const responses = spreadsheet.sheets.find(sheet => sheet.input && sheet.name !== '運営確認');
+  responses.values[1][0] = new Date('2026-01-02T00:00:00.000Z');
+  responses.values[1][4] = '1'; // Same identity, different cell type.
+  spreadsheet.getSheetByName('運営確認').values[2][5] = '新しいメモ';
+  const writes = spreadsheet.writes;
+  assert.throws(() => lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions), error => {
+    assert.match(error.message, /2行目 A2/);
+    assert.match(error.message, /2026-01-01T00:00:00.000Z.*日時・UTC.* → .*2026-01-02T00:00:00.000Z/);
+    assert.match(error.message, /2行目 E2.*出席番号.*1（数値） → "1"（文字列）/);
+    assert.match(error.message, /「運営確認」3行目 F3.*メモ.*"以前のメモ".* → "新しいメモ"/);
+    return true;
+  });
+  assert.equal(spreadsheet.writes, writes);
+});
+
+test('input-change errors identify deleted rows and the obsolete final column without changing old outputs', () => {
+  for (const kind of ['row', 'column']) {
+    const spreadsheet = new FakeSpreadsheet();
+    lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+    const responses = spreadsheet.sheets.find(sheet => sheet.input && sheet.name !== '運営確認');
+    if (kind === 'row') responses.values.pop();
+    else responses.values.forEach(row => row.pop());
+    const saved = clone(spreadsheet.sheets.filter(sheet => !sheet.input).map(sheet => sheet.values));
+    assert.throws(() => lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions), error => {
+      if (kind === 'row') {
+        assert.match(error.message, /26行×14列 → 25行×14列/);
+        assert.match(error.message, /26行目 A26.*削除: .* → （セルなし）/);
+      } else {
+        assert.match(error.message, /26行×14列 → 26行×13列/);
+        assert.match(error.message, /1行目 N1.*重複立候補不可チェック.*見出し.*削除:/);
+        assert.match(error.message, /差分 26セル/);
+        assert.match(error.message, /ほか 6セル/);
+      }
+      return true;
+    });
+    assert.deepEqual(spreadsheet.sheets.filter(sheet => !sheet.input).map(sheet => sheet.values), saved);
+  }
+});
+
+test('legacy input snapshots also produce cell-level change diagnostics', () => {
+  const spreadsheet = new FakeSpreadsheet();
+  const previous = legacyRun(spreadsheet);
+  spreadsheet.sheets.find(sheet => sheet.input && sheet.name !== '運営確認').values[1][12] = '旧版からの変更';
+  const writes = spreadsheet.writes;
+  assert.throws(() => lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions), error => {
+    assert.match(error.message, /比較元の実行ID: legacy-run/);
+    assert.match(error.message, /2行目 M2.*"旧版からの変更"/);
+    return true;
+  });
+  assert.equal(spreadsheet.writes, writes);
+  assert.ok(previous.every(sheet => !sheet.deleted));
+});
+
+test('missing or altered snapshots report unavailable differences rather than trusting changed copies', () => {
+  for (const kind of ['missing', 'altered']) {
+    const spreadsheet = new FakeSpreadsheet();
+    lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+    const snapshot = spreadsheet.getSheetByName('抽選_入力控え');
+    if (kind === 'missing') spreadsheet.deleteSheet(snapshot);
+    else {
+      const cell = snapshot.values[2];
+      const values = JSON.parse(cell[4]); values[12].value = '信用してはいけない控え';
+      cell[4] = JSON.stringify(values);
+    }
+    spreadsheet.sheets.find(sheet => sheet.input && sheet.name !== '運営確認').values[1][12] = '現在の回答';
+    const writes = spreadsheet.writes;
+    assert.throws(() => lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions), error => {
+      assert.match(error.message, /行・値の差分を特定できません/);
+      assert.match(error.message, /過去SHA256: [0-9a-f]{64}/);
+      assert.doesNotMatch(error.message, /信用してはいけない控え|2行目 M2/);
+      return true;
+    });
+    assert.equal(spreadsheet.writes, writes);
+  }
+});
+
+test('large change errors show total counts and truncate values without changing source strings', () => {
+  const spreadsheet = new FakeSpreadsheet();
+  lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+  const responses = spreadsheet.sheets.find(sheet => sheet.input && sheet.name !== '運営確認');
+  const longValue = '架空の長いメモ😀\n'.repeat(50);
+  responses.values.slice(1).forEach(row => { row[12] = longValue; });
+  assert.throws(() => lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions), error => {
+    assert.match(error.message, /差分 25セル/);
+    assert.match(error.message, /ほか 5セル。先頭20件のみ表示/);
+    assert.match(error.message, /…（省略）/);
+    assert.doesNotMatch(error.message, /26行目 M26/);
+    return true;
+  });
+  assert.equal(responses.values[1][12], longValue);
 });
 
 test('unrelated sheets with output-like names are preserved and reserved-name collisions are rejected', () => {

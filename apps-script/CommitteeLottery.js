@@ -1,5 +1,5 @@
 const LOTTERY_SEED = 'b76d3492fed64a918e465b43d3e62f6997fa8bef71cd4d48a7a5507e11072f9b';
-const LOTTERY_VERSION = '1.1.0';
+const LOTTERY_VERSION = '1.1.1';
 const LOTTERY_ALGORITHM_VERSION = '1.0.0';
 const LOTTERY_PRNG = 'SHA-256-chain / uint32-be / rejection-sampling / Fisher-Yates';
 const LOTTERY_OUTPUT_OWNER = 'CommitteeAssignmentLottery/output-v2';
@@ -866,13 +866,119 @@ function formatOutput_(sheet, label, height, width) {
   sheet.getRange(1, 1, Math.max(height, 1), width).setWrapStrategy(clip);
 }
 
-function assertUnchangedInputs_(record, groups, history) {
-  groups.map(function (group) { return group.record; }).concat(history.map(function (entry) { return entry.record; }))
-    .forEach(function (old) {
-      if (old.responsesHash !== record.responsesHash || old.operationsHash !== record.operationsHash) {
-        throw new Error('元回答または運営確認が過去の実行から変わっています。過去を再検証できるよう旧入力を保管するまで、旧出力の整理を停止します。');
-      }
+/** 控えの全文が当時のハッシュと一致する場合だけ、差分の比較元として使う。 */
+function storedInputForDiff_(group, kind, expectedHash, digest) {
+  const item = group.items.find(function (entry) { return entry.label === '入力控え'; });
+  if (!item) return null;
+  try {
+    let body;
+    if (group.legacy) body = item.body;
+    else {
+      const values = item.sheet.getDataRange().getValues();
+      const header = ['入力種別', '元シートID', '元シート名', '元行番号', '値のJSON（型付き）'];
+      if (JSON.stringify(values[0].slice(0, header.length)) !== JSON.stringify(header)) return null;
+      body = values.slice(1);
+    }
+    const rows = body.filter(function (row) { return row[0] === kind; })
+      .sort(function (a, b) { return Number(a[3]) - Number(b[3]); });
+    if (!rows.length || !rows.every(function (row, index) {
+      return Number(row[3]) === index + 1 && row[2] === rows[0][2] && typeof row[4] === 'string';
+    })) return null;
+    const serialized = rows.map(function (row) { return row[4]; });
+    if (hashText_(JSON.stringify(serialized), digest) !== expectedHash) return null;
+    const cells = serialized.map(function (row) {
+      const parsed = JSON.parse(row);
+      if (!Array.isArray(parsed) || !parsed.every(function (cell) {
+        return cell && ['string', 'number', 'boolean', 'date'].includes(cell.type) &&
+          (cell.type === 'date' ? typeof cell.value === 'string' : typeof cell.value === cell.type);
+      })) throw new Error('入力控えのセル形式が不正です。');
+      return parsed;
     });
+    return { name: text_(rows[0][2]), cells: cells, runId: group.record.runId };
+  } catch (error) { return null; }
+}
+
+function diffText_(value, maximum) {
+  const text = JSON.stringify(value);
+  const characters = Array.from(text === undefined ? String(value) : text);
+  return characters.length > maximum ? characters.slice(0, maximum).join('') + '…（省略）' : characters.join('');
+}
+
+function diffCellText_(cell) {
+  if (!cell) return '（セルなし）';
+  const types = { string: '文字列', number: '数値', boolean: '真偽値', date: '日時・UTC' };
+  return diffText_(cell.value, 160) + '（' + types[cell.type] + '）';
+}
+
+function diffColumnName_(column) {
+  let name = '';
+  for (let value = column + 1; value > 0; value = Math.floor((value - 1) / 26)) {
+    name = String.fromCharCode(65 + (value - 1) % 26) + name;
+  }
+  return name;
+}
+
+function inputDiffLines_(previous, current, kind) {
+  const before = previous.cells;
+  const after = current.values.map(function (row) { return JSON.parse(serializedRow_(row)); });
+  function headerIndex(rows) {
+    if (kind === '元回答') return 0;
+    return rows.findIndex(function (row) {
+      try { operationsColumns_(row.map(function (cell) { return cell.value; })); return true; }
+      catch (error) { return false; }
+    });
+  }
+  const oldHeaderIndex = headerIndex(before); const newHeaderIndex = headerIndex(after);
+  const oldHeader = before[oldHeaderIndex] || []; const newHeader = after[newHeaderIndex] || [];
+  const lines = []; let count = 0;
+  for (let row = 0; row < Math.max(before.length, after.length); row += 1) {
+    const oldRow = before[row] || []; const newRow = after[row] || [];
+    for (let column = 0; column < Math.max(oldRow.length, newRow.length); column += 1) {
+      const oldCell = oldRow[column]; const newCell = newRow[column];
+      if (JSON.stringify(oldCell) === JSON.stringify(newCell)) continue;
+      count += 1;
+      if (lines.length >= 20) continue;
+      const oldLabel = oldHeader[column] ? text_(oldHeader[column].value) : '';
+      const newLabel = newHeader[column] ? text_(newHeader[column].value) : '';
+      const label = oldLabel && newLabel && oldLabel !== newLabel ? oldLabel + ' → ' + newLabel : newLabel || oldLabel || '項目名なし';
+      const position = diffColumnName_(column) + (row + 1);
+      const change = !oldCell ? '追加' : !newCell ? '削除' : '変更';
+      lines.push('「' + current.name + '」' + (row + 1) + '行目 ' + position + '［' +
+        diffText_(label, 100) + '］' + (row === oldHeaderIndex || row === newHeaderIndex ? '（見出し）' : '') +
+        ' ' + change + ': ' + diffCellText_(oldCell) + ' → ' + diffCellText_(newCell));
+    }
+  }
+  const oldWidth = Math.max.apply(null, before.map(function (row) { return row.length; }));
+  const newWidth = Math.max.apply(null, after.map(function (row) { return row.length; }));
+  const heading = kind + '（比較元の実行ID: ' + previous.runId + '、入力控えの元シート: ' + previous.name + '）\n' +
+    '読取範囲: ' + before.length + '行×' + oldWidth + '列 → ' + after.length + '行×' + newWidth + '列。差分 ' + count + 'セル。';
+  if (count > lines.length) lines.push('ほか ' + (count - lines.length) + 'セル。先頭20件のみ表示しています。全文は入力控えと照合してください。');
+  return [heading].concat(lines);
+}
+
+function assertUnchangedInputs_(record, groups, history, captured, digest) {
+  const previous = groups.map(function (group) { return group.record; })
+    .concat(history.map(function (entry) { return entry.record; }));
+  const lines = []; const checked = new Set();
+  previous.forEach(function (old) {
+    [['元回答', 'responses', 'responsesHash'], ['運営確認', 'operations', 'operationsHash']].forEach(function (source) {
+      const kind = source[0]; const field = source[2];
+      if (old[field] === record[field] || checked.has(kind + old[field])) return;
+      checked.add(kind + old[field]);
+      let stored = null;
+      if (captured) {
+        groups.filter(function (group) { return group.record[field] === old[field]; }).some(function (group) {
+          stored = storedInputForDiff_(group, kind, old[field], digest);
+          return stored !== null;
+        });
+      }
+      if (stored) lines.push.apply(lines, inputDiffLines_(stored, captured[source[1]], kind));
+      else lines.push(kind + '（過去の実行ID: ' + old.runId + '）: 当時のハッシュと一致する入力控えが見つからないため、行・値の差分を特定できません。\n' +
+        '過去SHA256: ' + old[field] + '\n現在SHA256: ' + record[field]);
+    });
+  });
+  if (lines.length) throw new Error('元回答または運営確認が過去の実行から変わっています。旧出力の整理を停止します。\n' +
+    '以下は行・列の位置で比較した変更前 → 変更後です。行・列の挿入や削除では後続セルも差分になります。\n' + lines.join('\n'));
 }
 
 function writeOutputPlans_(spreadsheet, plans, runId, status, flush, options) {
@@ -882,7 +988,7 @@ function writeOutputPlans_(spreadsheet, plans, runId, status, flush, options) {
   const history = historyRows_(spreadsheet.getSheetByName(LOTTERY_HISTORY_NAME));
   const inventory = collectOutputRuns_(spreadsheet, protectedIds, options.digest);
   let record = Object.assign({}, plans[0].record);
-  assertUnchangedInputs_(record, inventory.groups, history);
+  assertUnchangedInputs_(record, inventory.groups, history, options.captured, options.digest);
   const usedIds = new Set(history.map(function (entry) { return entry.record.runId; })
     .concat(inventory.groups.map(function (group) { return group.record.runId; })));
   let suffix = 1;
@@ -989,7 +1095,7 @@ function executeLotteryOnSpreadsheet_(spreadsheet, options) {
   context.record = makeRunRecord_(captured, result, context);
   const plans = buildOutputPlans_(captured, result, context);
   const output = writeOutputPlans_(spreadsheet, plans, options.runId, result.status, options.flush, {
-    digest: options.digest, protectedIds: [captured.responses.id, captured.operations.id]
+    digest: options.digest, captured: captured, protectedIds: [captured.responses.id, captured.operations.id]
   });
   return {
     status: result.status, runId: output.runId, sheetNames: output.sheetNames, warnings: output.warnings,
