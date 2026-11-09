@@ -50,7 +50,9 @@ test('presentation changes preserve the version 1.0 deterministic audit trace', 
   const data = balanced();
   const extra = response('A組', 90, '特に希望なし', { chair: false, second: roles[1], meetings: '参加できます' });
   data.push(extra);
-  const result = engine(data);
+  // The version 1.0 reference hash belongs to this fixture seed, independent of the operational seed.
+  const referenceSeed = '72f7c0a2629261e23b8f7627a22233d17c72740d6305acdc9716789bf70ec83c';
+  const result = engine(data, operations(), { seed: referenceSeed });
   assert.equal(crypto.createHash('sha256').update(JSON.stringify(result.audit)).digest('hex'),
     '41bb13fc68eb788fdf6908b94eea9a9ad3cf6265bf30293abdac46140538a516');
 });
