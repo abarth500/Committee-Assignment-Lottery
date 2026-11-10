@@ -1,5 +1,5 @@
-const LOTTERY_SEED = 'b76d3492fed64a918e465b43d3e62f6997fa8bef71cd4d48a7a5507e11072f9b';
-const LOTTERY_VERSION = '1.1.1';
+const LOTTERY_SEED = 'a4e9d4bfe3a04a2eb53914b029132873c0d2774400784ecabdc141db0d6348fb';
+const LOTTERY_VERSION = '1.1.2';
 const LOTTERY_ALGORITHM_VERSION = '1.0.0';
 const LOTTERY_PRNG = 'SHA-256-chain / uint32-be / rejection-sampling / Fisher-Yates';
 const LOTTERY_OUTPUT_OWNER = 'CommitteeAssignmentLottery/output-v2';
