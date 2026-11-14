@@ -1,7 +1,7 @@
 const LOTTERY_SEED = 'a4e9d4bfe3a04a2eb53914b029132873c0d2774400784ecabdc141db0d6348fb';
-const LOTTERY_VERSION = '1.2.0';
+const LOTTERY_VERSION = '1.2.1';
 const LOTTERY_ALGORITHM_VERSION = '1.0.0';
-const LOTTERY_RESERVE_VERSION = '1.0.0';
+const LOTTERY_RESERVE_VERSION = '1.1.0';
 const LOTTERY_RESERVE_LABELS = Object.freeze(['補欠名簿', '補欠記録']);
 const LOTTERY_PRNG = 'SHA-256-chain / uint32-be / rejection-sampling / Fisher-Yates';
 const LOTTERY_OUTPUT_OWNER = 'CommitteeAssignmentLottery/output-v2';
@@ -1127,7 +1127,7 @@ function executeLotteryOnSpreadsheet_(spreadsheet, options) {
   };
 }
 
-/** 本抽選の乱数や結果に触れず、未選出者の第1希望ごとに補欠順位を作る。 */
+/** 本抽選の乱数や結果に触れず、未選出者の第1・第2希望ごとに補欠順位を作る。 */
 function buildReserveList_(prepared, assignments, fixedFirstByKey, seed, digest) {
   if (typeof seed !== 'string' || !/^[0-9a-fA-F]{64}$/.test(seed)) throw new Error('補欠の元シードは64桁の16進数が必要です。');
   const selected = new Set(assignments.map(function (item) { return item.key; }));
@@ -1138,13 +1138,23 @@ function buildReserveList_(prepared, assignments, fixedFirstByKey, seed, digest)
     const blocked = person.exclusionReasons.filter(function (reason) { return reason !== 'MEETINGS_UNAVAILABLE'; });
     record('RESERVE_ELIGIBILITY', { key: person.key, included: blocked.length === 0, exclusions: blocked });
     if (blocked.length) return;
-    const committee = person.firstPreference || fixedFirstByKey[person.key] || null;
+    const first = person.firstPreference || fixedFirstByKey[person.key] || null;
+    const memberships = [];
+    if (first) memberships.push({ committee: first, preference: person.firstPreference ? '第1希望' : '第1希望（仮割当）' });
+    if (person.secondPreference) {
+      const existing = memberships.find(function (item) { return item.committee === person.secondPreference; });
+      if (existing) existing.preference += '・第2希望';
+      else memberships.push({ committee: person.secondPreference, preference: '第2希望' });
+    }
+    const notes = [];
+    if (person.exclusionReasons.includes('MEETINGS_UNAVAILABLE')) notes.push('繰上げ前に参加可否の確認が必要');
+    if (person.firstPreference === null) notes.push('第1希望は「特になし」');
     const candidate = { key: person.key, className: person.className, number: person.number, name: person.name,
-      sourceRow: person.sourceRow, committee: committee, rank: null, meetings: person.meetings,
+      sourceRow: person.sourceRow, committee: null, preference: '', rank: null, meetings: person.meetings,
       category: person.exclusionReasons.includes('MEETINGS_UNAVAILABLE') ? '準備・打ち合わせ参加不可' : '落選',
-      note: person.exclusionReasons.includes('MEETINGS_UNAVAILABLE') ? '繰上げ前に参加可否の確認が必要' : '' };
-    if (committee) candidates.push(candidate);
-    else { candidate.note = '第1希望なし・本抽選の仮割当なしのため班未割当'; unassigned.push(candidate); }
+      note: notes.join('／') };
+    if (memberships.length) memberships.forEach(function (membership) { candidates.push(Object.assign({}, candidate, membership)); });
+    else { candidate.note = notes.concat(['本抽選の仮割当なし・希望班未割当']).join('／'); unassigned.push(candidate); }
   });
   const ranked = [];
   LOTTERY_SETTINGS.committees.forEach(function (committee) {
@@ -1165,8 +1175,9 @@ function buildReserveList_(prepared, assignments, fixedFirstByKey, seed, digest)
   });
   return { ranked: ranked, unassigned: unassigned, seeds: seeds, audit: audit,
     listHash: hashText_(JSON.stringify({ version: LOTTERY_RESERVE_VERSION,
-      ranked: ranked.map(function (p) { return { key: p.key, committee: p.committee, rank: p.rank, category: p.category }; }),
-      unassigned: unassigned.map(function (p) { return p.key; }) }), digest),
+      ranked: ranked.map(function (p) { return { key: p.key, committee: p.committee, rank: p.rank,
+        category: p.category, preference: p.preference, note: p.note }; }),
+      unassigned: unassigned.map(function (p) { return { key: p.key, note: p.note }; }) }), digest),
     auditHash: hashText_(JSON.stringify(audit), digest) };
 }
 
@@ -1241,12 +1252,13 @@ function writeReservePlans_(spreadsheet, source, result, options) {
     listHash: result.listHash, auditHash: result.auditHash, rankedCount: result.ranked.length, unassignedCount: result.unassigned.length };
   const historyRecord = Object.assign({}, source.record, { reserve: metadata });
   const listRows = result.ranked.concat(result.unassigned).map(function (p) {
-    return [p.committee || '希望なし（班未割当）', p.rank || '', p.className, p.number, p.name, p.category, p.meetings, p.sourceRow, p.note];
+    return [p.committee || '希望なし（班未割当）', p.rank || '', p.className, p.number, p.name, p.category,
+      p.preference, p.meetings, p.sourceRow, p.note];
   });
   const logRows = [['生成情報', JSON.stringify(metadata)], ['本抽選', JSON.stringify(source.record)]]
     .concat(result.audit.map(function (event) { return [event.type, JSON.stringify(event.detail)]; }));
   const plans = [
-    { label: '補欠名簿', rows: [['班', '補欠順位', 'クラス', '出席番号', '名前', '区分', '準備・打ち合わせの回答', '元回答行', '確認事項']].concat(listRows) },
+    { label: '補欠名簿', rows: [['班', '補欠順位', 'クラス', '出席番号', '名前', '区分', '希望順位', '準備・打ち合わせの回答', '元回答行', '確認事項']].concat(listRows) },
     { label: '補欠記録', rows: [['種別', '内容（JSON）']].concat(logRows) }
   ];
   plans.forEach(function (plan) {
