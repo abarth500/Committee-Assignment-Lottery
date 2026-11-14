@@ -762,23 +762,59 @@ function reserveFixture() {
   return { data, ops };
 }
 
-test('reserve ranking uses last first preferences, includes meeting-unavailable applicants and preserves other exclusions', () => {
+test('reserve ranking uses both last preferences, includes meeting-unavailable applicants and preserves other exclusions', () => {
   const { data, ops } = reserveFixture();
   const prepared = freeze(lottery.prepareLotteryInput_(data, ops));
   const selected = freeze(engine(balanced()).assignments);
   const before = clone({ prepared, selected });
   const result = lottery.buildReserveList_(prepared, selected, { 'B組:92': roles[4] }, lottery.LOTTERY_SEED, digest);
   assert.deepEqual({ prepared, selected }, before);
-  const people = new Map(result.ranked.map(p => [p.key, p]));
-  assert.deepEqual([...people.keys()].sort(), ['A組:90', 'A組:91', 'B組:92', 'E組:91']);
-  assert.equal(people.get('A組:90').committee, roles[3]);
-  assert.equal(people.get('A組:91').committee, roles[1]);
-  assert.equal(people.get('A組:91').category, '準備・打ち合わせ参加不可');
-  assert.match(people.get('A組:91').note, /参加可否の確認/);
-  assert.equal(people.get('B組:92').committee, roles[4]);
+  const entries = key => result.ranked.filter(p => p.key === key);
+  assert.deepEqual([...new Set(result.ranked.map(p => p.key))].sort(), ['A組:90', 'A組:91', 'B組:92', 'E組:91']);
+  assert.deepEqual(entries('A組:90').map(p => p.committee), [roles[2], roles[3]]);
+  assert.deepEqual(entries('A組:91').map(p => p.committee), [roles[1], roles[2]]);
+  assert.deepEqual(entries('A組:91').map(p => p.preference), ['第1希望', '第2希望']);
+  assert.ok(entries('A組:91').every(p => p.category === '準備・打ち合わせ参加不可'));
+  assert.ok(entries('A組:91').every(p => p.note.includes('参加可否の確認')));
+  assert.equal(entries('B組:92')[0].committee, roles[4]);
+  assert.match(entries('B組:92')[0].note, /第1希望は「特になし」/);
   assert.deepEqual(result.unassigned.map(p => p.key), ['C組:92']);
-  assert.ok(!result.ranked.some(p => p.committee === roles[2])); // Second preferences are not used.
+  assert.match(result.unassigned[0].note, /第1希望は「特になし」/);
+  assert.match(result.unassigned[0].note, /参加可否の確認/);
   assert.deepEqual(result, lottery.buildReserveList_(prepared, selected, { 'B組:92': roles[4] }, lottery.LOTTERY_SEED, digest));
+});
+
+test('reserve memberships deduplicate identical preferences and mark no-first-preference candidates in every row', () => {
+  const data = balanced();
+  data.push(response('A組', 90, roles[0], { second: roles[0] }));
+  data.push(response('B組', 90, '特に希望なし', { second: roles[2] }));
+  data.push(response('C組', 90, '特になし', { second: roles[2], meetings: '参加できません' }));
+  data.push(response('D組', 90, '特に希望なし', { meetings: '参加できません' }));
+  data.push(response('E組', 90, '特に希望なし', { second: roles[4] }));
+  const prepared = freeze(lottery.prepareLotteryInput_(data, operations()));
+  const result = lottery.buildReserveList_(prepared, engine(balanced()).assignments,
+    { 'B組:90': roles[4], 'E組:90': roles[4] }, lottery.LOTTERY_SEED, digest);
+  const entries = key => result.ranked.filter(p => p.key === key);
+  assert.equal(entries('A組:90').length, 1);
+  assert.equal(entries('A組:90')[0].preference, '第1希望・第2希望');
+  assert.deepEqual(entries('B組:90').map(p => p.committee), [roles[2], roles[4]]);
+  assert.equal(entries('C組:90').length, 1);
+  assert.equal(entries('C組:90')[0].preference, '第2希望');
+  assert.match(entries('C組:90')[0].note, /参加可否の確認/);
+  assert.equal(entries('E組:90').length, 1);
+  assert.equal(entries('E組:90')[0].preference, '第1希望（仮割当）・第2希望');
+  for (const key of ['B組:90', 'C組:90', 'E組:90']) {
+    assert.ok(entries(key).every(p => p.note.includes('第1希望は「特になし」')));
+  }
+  assert.deepEqual(result.unassigned.map(p => p.key), ['D組:90']);
+  assert.match(result.unassigned[0].note, /第1希望は「特になし」/);
+  assert.match(result.unassigned[0].note, /参加可否の確認/);
+  assert.match(result.unassigned[0].note, /希望班未割当/);
+  for (const role of roles) {
+    const members = result.ranked.filter(p => p.committee === role);
+    assert.equal(new Set(members.map(p => p.key)).size, members.length);
+    assert.deepEqual(members.map(p => p.rank), members.map((_, i) => i + 1));
+  }
 });
 
 test('reserve shuffles use independently derived committee seeds and consecutive complete rankings', () => {
@@ -816,6 +852,14 @@ test('saved-result reserves preserve all seven original outputs and regenerate w
   assert.equal(list.values[0][0], '班');
   assert.equal(list.frozenRows, 1);
   assert.ok(list.filter);
+  const preferenceColumn = list.values[0].indexOf('希望順位');
+  const noteColumn = list.values[0].indexOf('確認事項');
+  assert.ok(preferenceColumn >= 0 && noteColumn >= 0);
+  const meetingUnavailable = list.values.slice(1).filter(row => row[2] === 'A組' && row[3] === 91);
+  assert.deepEqual(meetingUnavailable.map(row => row[preferenceColumn]), ['第1希望', '第2希望']);
+  const noPreference = list.values.slice(1).find(row => row[2] === 'C組' && row[3] === 92);
+  assert.match(noPreference[noteColumn], /第1希望は「特になし」/);
+  assert.match(noPreference[noteColumn], /参加可否の確認/);
   assert.deepEqual(spreadsheet.sheets.slice(0, 4).map(s => s.name), ['抽選_結果', '抽選_役職希望者', '抽選_実行情報', '抽選_補欠名簿']);
   assert.equal(lottery.readOutputNote_(list).reserve.seed, 'ab'.repeat(32));
   assert.deepEqual(original.map(s => ({ id: s.id, name: s.name, values: s.values, notes: s.notes })), saved);
