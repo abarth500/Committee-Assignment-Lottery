@@ -743,6 +743,183 @@ test('buffered output failure cannot confirm winners', () => {
     .every(s => lottery.readOutputNote_(s).phase === 'failed'));
 });
 
+function reserveFixture() {
+  const data = balanced();
+  data.push(response('A組', 90, roles[0], { second: roles[2] }));
+  data.push(response('A組', 91, roles[1], { second: roles[2], meetings: '参加できません' }));
+  data.push(response('B組', 91, roles[0]));
+  data.push(response('C組', 91, roles[0], { orientation: '参加できません' }));
+  data.push(response('D組', 91, roles[0], { meetings: '参加できません' }));
+  data.push(response('E組', 91, roles[1], { orientation: '参加できません', meetings: '参加できません' }));
+  data.push(response('A組', 90, roles[3], { second: roles[2] })); // Last response wins.
+  data.push(response('B組', 92, '特に希望なし'));
+  data.push(response('C組', 92, '特に希望なし', { meetings: '参加できません' }));
+  const ops = operations([
+    ['B組', 91, '', '', '架空の委員', 'fixture'],
+    ['D組', 91, '', '', '架空の委員', 'fixture'],
+    ['E組', 91, '公欠', '', '', 'fixture']
+  ]);
+  return { data, ops };
+}
+
+test('reserve ranking uses last first preferences, includes meeting-unavailable applicants and preserves other exclusions', () => {
+  const { data, ops } = reserveFixture();
+  const prepared = freeze(lottery.prepareLotteryInput_(data, ops));
+  const selected = freeze(engine(balanced()).assignments);
+  const before = clone({ prepared, selected });
+  const result = lottery.buildReserveList_(prepared, selected, { 'B組:92': roles[4] }, lottery.LOTTERY_SEED, digest);
+  assert.deepEqual({ prepared, selected }, before);
+  const people = new Map(result.ranked.map(p => [p.key, p]));
+  assert.deepEqual([...people.keys()].sort(), ['A組:90', 'A組:91', 'B組:92', 'E組:91']);
+  assert.equal(people.get('A組:90').committee, roles[3]);
+  assert.equal(people.get('A組:91').committee, roles[1]);
+  assert.equal(people.get('A組:91').category, '準備・打ち合わせ参加不可');
+  assert.match(people.get('A組:91').note, /参加可否の確認/);
+  assert.equal(people.get('B組:92').committee, roles[4]);
+  assert.deepEqual(result.unassigned.map(p => p.key), ['C組:92']);
+  assert.ok(!result.ranked.some(p => p.committee === roles[2])); // Second preferences are not used.
+  assert.deepEqual(result, lottery.buildReserveList_(prepared, selected, { 'B組:92': roles[4] }, lottery.LOTTERY_SEED, digest));
+});
+
+test('reserve shuffles use independently derived committee seeds and consecutive complete rankings', () => {
+  const data = balanced();
+  classes.forEach(c => { for (let n = 90; n < 95; n++) data.push(response(c, n, roles[0])); });
+  const prepared = lottery.prepareLotteryInput_(data, operations());
+  const selected = engine(balanced()).assignments;
+  const original = lottery.buildReserveList_(prepared, selected, {}, lottery.LOTTERY_SEED, digest);
+  assert.equal(new Set(Object.values(original.seeds)).size, 5);
+  const referenceSeed = crypto.createHash('sha256').update(JSON.stringify(['committee-reserve/v1', lottery.LOTTERY_SEED, roles[0]])).digest('hex');
+  assert.equal(original.seeds[roles[0]], referenceSeed);
+  assert.deepEqual(original.ranked.map(p => p.rank), Array.from({ length: 25 }, (_, i) => i + 1));
+  assert.equal(new Set(original.ranked.map(p => p.key)).size, 25);
+  assert.notDeepEqual(original.ranked.map(p => p.key), prepared.candidates.filter(p => p.number >= 90).map(p => p.key));
+  data.push(response('E組', 99, roles[1]));
+  const extended = lottery.buildReserveList_(lottery.prepareLotteryInput_(data, operations()), selected, {}, lottery.LOTTERY_SEED, digest);
+  assert.deepEqual(extended.ranked.filter(p => p.committee === roles[0]), original.ranked);
+  assert.equal(original.audit.filter(e => e.type === 'RESERVE_RANDOM').length, 24);
+});
+
+test('saved-result reserves preserve all seven original outputs and regenerate without changing winners or ranks', () => {
+  const { data, ops } = reserveFixture();
+  const spreadsheet = new FakeSpreadsheet(data, ops);
+  lottery.executeLotteryOnSpreadsheet_(spreadsheet, { ...runOptions, seed: 'ab'.repeat(32) });
+  const original = spreadsheet.sheets.filter(s => lottery.readOutputNote_(s)?.kind === 'output');
+  const saved = clone(original.map(s => ({ id: s.id, name: s.name, values: s.values, notes: s.notes })));
+  original.forEach(s => { s.input = true; }); // Fail any attempted write to original lottery outputs.
+  const historySheet = spreadsheet.getSheetByName(lottery.LOTTERY_HISTORY_NAME);
+  const pastHistory = clone(historySheet.values);
+  const first = lottery.executeReservesOnSpreadsheet_(spreadsheet, { ...runOptions, runId: 'reserve-fixture' });
+  assert.equal(first.baseRunId, 'fixture-run');
+  assert.equal(first.sheetNames.length, 2);
+  const list = spreadsheet.getSheetByName('抽選_補欠名簿');
+  const record = spreadsheet.getSheetByName('抽選_補欠記録');
+  assert.equal(list.values[0][0], '班');
+  assert.equal(list.frozenRows, 1);
+  assert.ok(list.filter);
+  assert.deepEqual(spreadsheet.sheets.slice(0, 4).map(s => s.name), ['抽選_結果', '抽選_役職希望者', '抽選_実行情報', '抽選_補欠名簿']);
+  assert.equal(lottery.readOutputNote_(list).reserve.seed, 'ab'.repeat(32));
+  assert.deepEqual(original.map(s => ({ id: s.id, name: s.name, values: s.values, notes: s.notes })), saved);
+  assert.deepEqual(historySheet.values.slice(0, pastHistory.length), pastHistory);
+  const rows = clone(list.values);
+  const second = lottery.executeReservesOnSpreadsheet_(spreadsheet, { ...runOptions, runId: 'reserve-fixture' });
+  assert.equal(second.reserveId, 'reserve-fixture_1');
+  assert.ok(list.deleted && record.deleted);
+  assert.deepEqual(spreadsheet.getSheetByName('抽選_補欠名簿').values, rows);
+  assert.deepEqual(original.map(s => ({ id: s.id, name: s.name, values: s.values, notes: s.notes })), saved);
+  assert.ok(!JSON.stringify(historySheet.values).includes('架空'));
+  const captured = lottery.readInputSheets_(spreadsheet);
+  assert.deepEqual(lottery.verifyHistoryEntries_(captured, lottery.historyRows_(historySheet), digest).map(v => v.verification), ['一致']);
+  original.forEach(s => { s.input = false; });
+  const reserves = spreadsheet.sheets.filter(s => lottery.readOutputNote_(s)?.kind === 'reserve');
+  lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+  assert.ok(reserves.every(s => s.deleted));
+  assert.equal(spreadsheet.sheets.length, 10);
+});
+
+test('reserve generation rejects absent or unsuccessful results, changed inputs, tampered results and tampered logs before writes', () => {
+  const absent = new FakeSpreadsheet();
+  assert.throws(() => lottery.executeReservesOnSpreadsheet_(absent, runOptions), /保存が完了/);
+  assert.equal(absent.writes, 0);
+  for (const kind of ['unsuccessful', 'inputs', 'result', 'log', 'incomplete', 'history']) {
+    const spreadsheet = new FakeSpreadsheet(kind === 'unsuccessful' ? oneLeaderCommittee() : balanced());
+    lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+    if (kind === 'inputs') spreadsheet.sheets.find(s => s.input && s.name !== '運営確認').values[1][12] = 'changed';
+    if (kind === 'result') spreadsheet.getSheetByName('抽選_結果').values[1][0] = roles[4];
+    if (kind === 'log') spreadsheet.getSheetByName('抽選_詳細ログ').values[1][2] = '{}';
+    if (kind === 'incomplete') spreadsheet.deleteSheet(spreadsheet.getSheetByName('抽選_入力控え'));
+    if (kind === 'history') spreadsheet.getSheetByName(lottery.LOTTERY_HISTORY_NAME).values.pop();
+    const writes = spreadsheet.writes;
+    assert.throws(() => lottery.executeReservesOnSpreadsheet_(spreadsheet, runOptions));
+    assert.equal(spreadsheet.writes, writes, kind);
+    assert.equal(spreadsheet.getSheetByName('抽選_補欠名簿'), null);
+  }
+});
+
+test('reserve regeneration rolls back failures and cleans only managed reserve sheets after a successful retry', () => {
+  for (const failure of ['write', 'rename', 'flush']) {
+    const spreadsheet = new FakeSpreadsheet();
+    lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+    lottery.executeReservesOnSpreadsheet_(spreadsheet, runOptions);
+    const lotterySheets = spreadsheet.sheets.filter(s => lottery.readOutputNote_(s)?.kind === 'output');
+    const saved = clone(lotterySheets.map(s => ({ name: s.name, values: s.values, notes: s.notes })));
+    const previous = spreadsheet.getSheetByName('抽選_補欠名簿');
+    const previousRows = clone(previous.values);
+    if (failure === 'write') spreadsheet.failWriteAt = spreadsheet.writes + 2;
+    if (failure === 'rename') spreadsheet.failRenameAt = spreadsheet.renames + 3;
+    let flushes = 0;
+    assert.throws(() => lottery.executeReservesOnSpreadsheet_(spreadsheet, { ...runOptions,
+      flush() { if (failure === 'flush' && ++flushes === 4) throw Error('simulated final flush failure'); }
+    }), /補欠名簿の保存に失敗/);
+    assert.ok(!previous.deleted);
+    assert.deepEqual(previous.values, previousRows);
+    assert.equal(spreadsheet.getSheetByName('抽選_補欠名簿'), previous);
+    assert.deepEqual(lotterySheets.map(s => ({ name: s.name, values: s.values, notes: s.notes })), saved);
+    spreadsheet.failWriteAt = undefined; spreadsheet.failRenameAt = undefined;
+    lottery.executeReservesOnSpreadsheet_(spreadsheet, runOptions);
+    assert.ok(previous.deleted);
+    assert.equal(spreadsheet.sheets.filter(s => lottery.readOutputNote_(s)?.kind === 'reserve').length, 2);
+  }
+});
+
+test('reserve output-name collisions preserve user sheets and copied reserve sheets are never silently deleted', () => {
+  const spreadsheet = new FakeSpreadsheet();
+  lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+  const unrelated = new FakeSheet(spreadsheet, '抽選_補欠名簿', [['keep me']]); spreadsheet.sheets.push(unrelated);
+  const writes = spreadsheet.writes;
+  assert.throws(() => lottery.executeReservesOnSpreadsheet_(spreadsheet, runOptions), /管理対象外シート/);
+  assert.equal(spreadsheet.writes, writes);
+  assert.ok(!unrelated.deleted);
+  spreadsheet.deleteSheet(unrelated);
+  lottery.executeReservesOnSpreadsheet_(spreadsheet, runOptions);
+  const list = spreadsheet.getSheetByName('抽選_補欠名簿');
+  const copy = new FakeSheet(spreadsheet, '抽選_補欠のコピー', list.values); copy.notes = clone(list.notes); spreadsheet.sheets.push(copy);
+  assert.throws(() => lottery.executeReservesOnSpreadsheet_(spreadsheet, runOptions), /複製/);
+  assert.ok(!copy.deleted && !list.deleted);
+});
+
+test('reserve menu entry never reruns the lottery and releases its lock on success and failure', () => {
+  const spreadsheet = new FakeSpreadsheet();
+  lottery.executeLotteryOnSpreadsheet_(spreadsheet, runOptions);
+  spreadsheet.toast = () => {};
+  let releases = 0;
+  const context = {
+    SpreadsheetApp: { getActiveSpreadsheet: () => spreadsheet, flush() {} },
+    LockService: { getDocumentLock: () => ({ tryLock: () => true, releaseLock() { releases++; } }) },
+    Utilities: { DigestAlgorithm: { SHA_256: 'SHA_256' },
+      computeDigest: (_, bytes) => digest(bytes).map(b => b > 127 ? b - 256 : b),
+      formatDate: () => 'reserve-menu', getUuid: () => '00000000-fixture' }
+  };
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(require.resolve('../apps-script/CommitteeLottery.js'), 'utf8'), context);
+  context.runLotteryEngine_ = () => { throw Error('must not rerun lottery'); };
+  const summary = context.createCommitteeReserves();
+  assert.equal(summary.baseRunId, 'fixture-run');
+  assert.equal(releases, 1);
+  spreadsheet.deleteSheet(spreadsheet.getSheetByName('抽選_結果'));
+  assert.throws(() => context.createCommitteeReserves(), /成立済み/);
+  assert.equal(releases, 2);
+});
+
 test('Apps Script entry point uses signed digest bytes, flushes outputs and releases the document lock', () => {
   const spreadsheet = new FakeSpreadsheet();
   const notifications = [];

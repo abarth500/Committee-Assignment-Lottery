@@ -1,6 +1,8 @@
 const LOTTERY_SEED = 'a4e9d4bfe3a04a2eb53914b029132873c0d2774400784ecabdc141db0d6348fb';
-const LOTTERY_VERSION = '1.1.2';
+const LOTTERY_VERSION = '1.2.0';
 const LOTTERY_ALGORITHM_VERSION = '1.0.0';
+const LOTTERY_RESERVE_VERSION = '1.0.0';
+const LOTTERY_RESERVE_LABELS = Object.freeze(['補欠名簿', '補欠記録']);
 const LOTTERY_PRNG = 'SHA-256-chain / uint32-be / rejection-sampling / Fisher-Yates';
 const LOTTERY_OUTPUT_OWNER = 'CommitteeAssignmentLottery/output-v2';
 const LOTTERY_OUTPUT_LABELS = Object.freeze(['結果', '役職希望者', '実行情報', '詳細ログ', '元データ統計', '結果統計', '入力控え']);
@@ -22,6 +24,7 @@ function onOpen() {
   SpreadsheetApp.getUi().createMenu('委員抽選')
     .addItem('入力・成立条件を確認（書込なし）', 'previewCommitteeLottery')
     .addItem('抽選を実行して最新結果を保存', 'runCommitteeLottery')
+    .addItem('保存済み結果から補欠名簿を作成', 'createCommitteeReserves')
     .addItem('実行履歴をハッシュ照合（書込なし）', 'verifyLotteryHistory')
     .addToUi();
 }
@@ -799,11 +802,19 @@ function legacyRecord_(items, digest) {
 }
 
 function collectOutputRuns_(spreadsheet, protectedIds, digest) {
-  const groups = new Map(); const legacy = new Map(); const warnings = [];
+  const groups = new Map(); const legacy = new Map(); const warnings = []; const reserves = [];
   spreadsheet.getSheets().forEach(function (sheet) {
     if (protectedIds.has(sheet.getSheetId()) || !sheet.getName().startsWith(LOTTERY_SETTINGS.outputPrefix) ||
         sheet.getName() === LOTTERY_HISTORY_NAME) return;
     const note = readOutputNote_(sheet);
+    if (note && note.kind === 'reserve') {
+      if (!validRunRecord_(note.record) || !LOTTERY_RESERVE_LABELS.includes(note.label) ||
+          !note.reserve || typeof note.reserve.id !== 'string' || !/^[0-9a-f]{64}$/.test(note.reserve.listHash || '')) {
+        throw new Error('補欠シートの管理情報が不正です。自動削除せず確認してください。');
+      }
+      reserves.push({ sheet: sheet, label: note.label, record: note.record, reserve: note.reserve });
+      return;
+    }
     if (note && note.kind === 'output') {
       if (!validRunRecord_(note.record) || !LOTTERY_OUTPUT_LABELS.includes(note.label)) {
         throw new Error('出力シートの管理情報が不正です。自動削除せず確認してください。');
@@ -830,10 +841,18 @@ function collectOutputRuns_(spreadsheet, protectedIds, digest) {
     if (groups.has(id)) throw new Error('旧版と新版で実行IDが重複しています。');
     groups.set(id, { record: record, items: items, legacy: true });
   });
+  reserves.forEach(function (item) {
+    if (!groups.has(item.record.runId)) groups.set(item.record.runId, { record: item.record, items: [], legacy: false });
+    const group = groups.get(item.record.runId);
+    if (JSON.stringify(group.record) !== JSON.stringify(item.record)) throw new Error('補欠と本抽選の管理情報が一致しません。');
+    group.reserves = (group.reserves || []).concat([item]);
+  });
   groups.forEach(function (group) {
     if (new Set(group.items.map(function (item) { return item.label; })).size !== group.items.length) {
       throw new Error('同一実行に同じ種類の出力が複数あります。複製したシートを保全したまま確認してください。');
     }
+    const keys = (group.reserves || []).map(function (item) { return item.reserve.id + '/' + item.label; });
+    if (new Set(keys).size !== keys.length) throw new Error('同じ補欠シートの複製があります。自動削除せず確認してください。');
   });
   return { groups: Array.from(groups.values()), warnings: warnings };
 }
@@ -854,9 +873,10 @@ function formatOutput_(sheet, label, height, width) {
   head.setFontWeight('bold').setBackground('#1f4e78').setFontColor('#ffffff');
   sheet.setRowHeight(1, 30);
   for (let column = 1; column <= width; column += 1) sheet.setColumnWidth(column, 130);
-  if (label === '結果' || label === '役職希望者') {
+  if (label === '結果' || label === '役職希望者' || label === '補欠名簿') {
     sheet.setColumnWidth(1, 180); sheet.setColumnWidth(2, 70); sheet.setColumnWidth(3, 80); sheet.setColumnWidth(4, 160);
     if (height > 1) sheet.getRange(1, 1, height, width).createFilter();
+    if (label === '補欠名簿') { sheet.setColumnWidth(4, 80); sheet.setColumnWidth(5, 160); sheet.setColumnWidth(width, 260); }
   } else if (label === '実行情報') {
     sheet.setColumnWidth(1, 220); sheet.setColumnWidth(2, 560);
   } else {
@@ -993,7 +1013,9 @@ function writeOutputPlans_(spreadsheet, plans, runId, status, flush, options) {
     .concat(inventory.groups.map(function (group) { return group.record.runId; })));
   let suffix = 1;
   while (usedIds.has(record.runId)) record.runId = runId + '_' + suffix++;
-  const oldSheets = inventory.groups.flatMap(function (group) { return group.items.map(function (item) { return item.sheet; }); });
+  const oldSheets = inventory.groups.flatMap(function (group) {
+    return group.items.concat(group.reserves || []).map(function (item) { return item.sheet; });
+  });
   const oldIds = new Set(oldSheets.map(function (sheet) { return sheet.getSheetId(); }));
   LOTTERY_OUTPUT_LABELS.forEach(function (label) {
     const existing = spreadsheet.getSheetByName(LOTTERY_SETTINGS.outputPrefix + label);
@@ -1105,6 +1127,201 @@ function executeLotteryOnSpreadsheet_(spreadsheet, options) {
   };
 }
 
+/** 本抽選の乱数や結果に触れず、未選出者の第1希望ごとに補欠順位を作る。 */
+function buildReserveList_(prepared, assignments, fixedFirstByKey, seed, digest) {
+  if (typeof seed !== 'string' || !/^[0-9a-fA-F]{64}$/.test(seed)) throw new Error('補欠の元シードは64桁の16進数が必要です。');
+  const selected = new Set(assignments.map(function (item) { return item.key; }));
+  const audit = []; const candidates = []; const unassigned = []; const seeds = {};
+  function record(type, detail) { audit.push({ sequence: audit.length + 1, type: type, detail: detail }); }
+  prepared.candidates.slice().sort(comparePeople_).forEach(function (person) {
+    if (selected.has(person.key)) return;
+    const blocked = person.exclusionReasons.filter(function (reason) { return reason !== 'MEETINGS_UNAVAILABLE'; });
+    record('RESERVE_ELIGIBILITY', { key: person.key, included: blocked.length === 0, exclusions: blocked });
+    if (blocked.length) return;
+    const committee = person.firstPreference || fixedFirstByKey[person.key] || null;
+    const candidate = { key: person.key, className: person.className, number: person.number, name: person.name,
+      sourceRow: person.sourceRow, committee: committee, rank: null, meetings: person.meetings,
+      category: person.exclusionReasons.includes('MEETINGS_UNAVAILABLE') ? '準備・打ち合わせ参加不可' : '落選',
+      note: person.exclusionReasons.includes('MEETINGS_UNAVAILABLE') ? '繰上げ前に参加可否の確認が必要' : '' };
+    if (committee) candidates.push(candidate);
+    else { candidate.note = '第1希望なし・本抽選の仮割当なしのため班未割当'; unassigned.push(candidate); }
+  });
+  const ranked = [];
+  LOTTERY_SETTINGS.committees.forEach(function (committee) {
+    const derived = hashText_(JSON.stringify(['committee-reserve/v1', seed.toLowerCase(), committee]), digest);
+    seeds[committee] = derived;
+    const pool = candidates.filter(function (person) { return person.committee === committee; });
+    const random = createRandom_(derived, function (type, detail) {
+      record('RESERVE_' + type, Object.assign({ committee: committee }, detail));
+    }, digest);
+    const shuffled = pool.slice();
+    for (let i = shuffled.length - 1; i > 0; i -= 1) {
+      const j = random.nextInt(i + 1, 'reserve/' + committee + '/swap=' + i);
+      const item = shuffled[i]; shuffled[i] = shuffled[j]; shuffled[j] = item;
+    }
+    shuffled.forEach(function (person, index) { ranked.push(Object.assign({}, person, { rank: index + 1 })); });
+    record('RESERVE_RANKING', { committee: committee, seed: derived, pool: pool.map(function (p) { return p.key; }),
+      ranked: shuffled.map(function (p) { return p.key; }), randomPosition: random.position(), finalRandomState: random.state() });
+  });
+  return { ranked: ranked, unassigned: unassigned, seeds: seeds, audit: audit,
+    listHash: hashText_(JSON.stringify({ version: LOTTERY_RESERVE_VERSION,
+      ranked: ranked.map(function (p) { return { key: p.key, committee: p.committee, rank: p.rank, category: p.category }; }),
+      unassigned: unassigned.map(function (p) { return p.key; }) }), digest),
+    auditHash: hashText_(JSON.stringify(audit), digest) };
+}
+
+function readSavedLotteryForReserves_(spreadsheet, captured, digest) {
+  const resultSheet = spreadsheet.getSheetByName(LOTTERY_SETTINGS.outputPrefix + '結果');
+  const note = resultSheet && readOutputNote_(resultSheet);
+  if (!note || note.kind !== 'output' || note.label !== '結果' || note.phase !== 'published' ||
+      !validRunRecord_(note.record) || note.record.status !== 'ACCEPTED') {
+    throw new Error('保存が完了した成立済みの「抽選_結果」が必要です。本抽選は自動実行しません。');
+  }
+  const base = note.record;
+  if (base.algorithmVersion !== LOTTERY_ALGORITHM_VERSION) throw new Error('本抽選のアルゴリズム版に対応したコードで補欠名簿を作成してください。');
+  const history = historyRows_(spreadsheet.getSheetByName(LOTTERY_HISTORY_NAME));
+  if (!history.some(function (entry) { return entry.event === '保存完了' && entry.record.runId === base.runId &&
+      JSON.stringify(entry.record) === JSON.stringify(base); }) || history.some(function (entry) {
+    return entry.event === '保存失敗' && entry.record.runId === base.runId;
+  })) throw new Error('本抽選の保存完了を実行履歴で確認できません。補欠名簿を作成しません。');
+  const inventory = collectOutputRuns_(spreadsheet, new Set([captured.responses.id, captured.operations.id]), digest);
+  const group = inventory.groups.find(function (item) { return item.record.runId === base.runId; });
+  if (!group || !LOTTERY_OUTPUT_LABELS.every(function (label) {
+    const item = group.items.find(function (entry) { return entry.label === label; });
+    return item && readOutputNote_(item.sheet).phase === 'published';
+  })) throw new Error('本抽選の出力7種類の保存状態が一致しません。補欠名簿を作成しません。');
+  const current = Object.assign({}, base, { responsesHash: snapshotHash_(captured.responses.values, digest),
+    operationsHash: snapshotHash_(captured.operations.values, digest) });
+  assertUnchangedInputs_(current, inventory.groups, history, captured, digest);
+  const prepared = prepareLotteryInput_(captured.responses.data, captured.operations.data, captured);
+  const people = new Map(prepared.candidates.map(function (p) { return [p.key, p]; }));
+  const values = resultSheet.getDataRange().getValues();
+  if (JSON.stringify(values[0]) !== JSON.stringify(['班', 'クラス', '出席番号', '名前', '当選段階', '元回答行', '役職希望'])) {
+    throw new Error('抽選結果の見出しが変更されています。補欠名簿を作成しません。');
+  }
+  const assignments = values.slice(1).filter(function (row) { return row.some(function (value) { return text_(value); }); })
+    .map(function (row) {
+      const key = personKey_(row[1], row[2], '保存済み抽選結果').key;
+      if (!people.has(key) || !LOTTERY_SETTINGS.committees.includes(row[0]) ||
+          !['第1希望', '第1希望（仮割当）', '第2希望'].includes(row[4])) throw new Error('保存済み抽選結果の班・本人・当選段階が不正です。');
+      return { key: key, committee: row[0], stage: row[4] === '第2希望' ? 2 : 1 };
+    });
+  const leaders = assignments.filter(function (item) { return people.get(item.key).chairHope; });
+  if (new Set(assignments.map(function (item) { return item.key; })).size !== assignments.length ||
+      hashResult_(base.status, base.acceptedAttempt, assignments, leaders, digest) !== base.resultHash) {
+    throw new Error('保存済みの当選者・所属班が本抽選の結果ハッシュと一致しません。');
+  }
+  const log = group.items.find(function (item) { return item.label === '詳細ログ'; }).sheet.getDataRange().getValues();
+  if (JSON.stringify(log[0]) !== JSON.stringify(['連番', '種別', '内容（JSON）'])) throw new Error('本抽選ログの見出しが不正です。');
+  let audit;
+  try { audit = log.slice(1).map(function (row) { return { sequence: row[0], type: row[1], detail: JSON.parse(row[2]) }; }); }
+  catch (error) { throw new Error('本抽選ログのJSONが不正です。'); }
+  if (hashText_(JSON.stringify(audit), digest) !== base.auditHash) throw new Error('本抽選ログが保存時のハッシュと一致しません。');
+  const fixedFirstByKey = {};
+  audit.filter(function (event) { return event.type === 'FIXED_FIRST_PREFERENCE'; }).forEach(function (event) {
+    fixedFirstByKey[event.detail.key] = event.detail.committee;
+  });
+  return { record: base, prepared: prepared, assignments: assignments, fixedFirstByKey: fixedFirstByKey, inventory: inventory, history: history };
+}
+
+function writeReservePlans_(spreadsheet, source, result, options) {
+  const flush = options.flush || function () {};
+  const old = source.inventory.groups.flatMap(function (group) { return group.reserves || []; });
+  const used = new Set(old.map(function (item) { return item.reserve.id; }).concat(source.history
+    .filter(function (entry) { return entry.record.reserve; }).map(function (entry) { return entry.record.reserve.id; })));
+  let id = options.runId; let suffix = 1;
+  while (used.has(id)) id = options.runId + '_' + suffix++;
+  LOTTERY_RESERVE_LABELS.forEach(function (label) {
+    const sheet = spreadsheet.getSheetByName(LOTTERY_SETTINGS.outputPrefix + label);
+    if (sheet && !old.some(function (item) { return item.sheet === sheet; })) throw new Error('補欠の出力名が管理対象外シートと衝突しています: ' + label);
+  });
+  const metadata = { id: id, createdAt: options.startedAt, version: LOTTERY_RESERVE_VERSION,
+    codeVersion: LOTTERY_VERSION, sourceRevision: sourceRevision_(),
+    baseRunId: source.record.runId, seed: source.record.seed, seeds: result.seeds,
+    listHash: result.listHash, auditHash: result.auditHash, rankedCount: result.ranked.length, unassignedCount: result.unassigned.length };
+  const historyRecord = Object.assign({}, source.record, { reserve: metadata });
+  const listRows = result.ranked.concat(result.unassigned).map(function (p) {
+    return [p.committee || '希望なし（班未割当）', p.rank || '', p.className, p.number, p.name, p.category, p.meetings, p.sourceRow, p.note];
+  });
+  const logRows = [['生成情報', JSON.stringify(metadata)], ['本抽選', JSON.stringify(source.record)]]
+    .concat(result.audit.map(function (event) { return [event.type, JSON.stringify(event.detail)]; }));
+  const plans = [
+    { label: '補欠名簿', rows: [['班', '補欠順位', 'クラス', '出席番号', '名前', '区分', '準備・打ち合わせの回答', '元回答行', '確認事項']].concat(listRows) },
+    { label: '補欠記録', rows: [['種別', '内容（JSON）']].concat(logRows) }
+  ];
+  plans.forEach(function (plan) {
+    plan.rows = plan.rows.map(function (row) { return row.map(function (value) {
+      const cell = safeCell_(value);
+      if (typeof cell === 'string' && cell.length > 45000) throw new Error('補欠の記録が1セルの保存上限を超えます。');
+      return cell;
+    }); });
+  });
+  const created = []; const renamedOld = []; const renamedNew = [];
+  function mark(item, phase) {
+    item.sheet.getRange(1, 1).setNote(JSON.stringify({ owner: LOTTERY_OUTPUT_OWNER, kind: 'reserve', schema: 1,
+      label: item.plan.label, phase: phase, record: source.record, reserve: metadata }));
+  }
+  try {
+    plans.forEach(function (plan) {
+      const temporary = LOTTERY_SETTINGS.outputPrefix + '補欠保存中_' + id + '_' + plan.label;
+      const sheet = spreadsheet.insertSheet(temporary);
+      const item = { sheet: sheet, plan: plan, temporary: temporary }; created.push(item);
+      mark(item, 'staging'); sheet.hideSheet();
+      if (sheet.getMaxRows() < plan.rows.length) sheet.insertRowsAfter(sheet.getMaxRows(), plan.rows.length - sheet.getMaxRows());
+      for (let offset = 0; offset < plan.rows.length; offset += 500) {
+        const chunk = plan.rows.slice(offset, offset + 500);
+        sheet.getRange(offset + 1, 1, chunk.length, plan.rows[0].length).setNumberFormat('@').setValues(chunk);
+      }
+      formatOutput_(sheet, plan.label, plan.rows.length, plan.rows[0].length);
+    });
+    flush(); appendHistory_(spreadsheet, [{ event: '補欠保存準備', record: historyRecord }]); flush();
+    old.forEach(function (item) {
+      if (!LOTTERY_RESERVE_LABELS.some(function (label) { return item.sheet.getName() === LOTTERY_SETTINGS.outputPrefix + label; })) return;
+      const previousName = item.sheet.getName();
+      item.sheet.setName(LOTTERY_SETTINGS.outputPrefix + '補欠退避_' + item.sheet.getSheetId() + '_' + id);
+      renamedOld.push({ sheet: item.sheet, name: previousName });
+    });
+    created.forEach(function (item) { item.sheet.setName(LOTTERY_SETTINGS.outputPrefix + item.plan.label); renamedNew.push(item); mark(item, 'published'); });
+    flush();
+    created.forEach(function (item) { item.sheet.showSheet(); });
+    spreadsheet.setActiveSheet(created[0].sheet); spreadsheet.moveActiveSheet(4);
+    appendHistory_(spreadsheet, [{ event: '補欠保存完了', record: historyRecord }]); flush();
+  } catch (error) {
+    renamedNew.slice().reverse().forEach(function (item) { try { item.sheet.setName(item.temporary); } catch (ignored) { /* 保持 */ } });
+    renamedOld.slice().reverse().forEach(function (item) { try { item.sheet.setName(item.name); } catch (ignored) { /* 保持 */ } });
+    created.forEach(function (item) { try { mark(item, 'failed'); item.sheet.showSheet(); } catch (ignored) { /* 保持 */ } });
+    try { appendHistory_(spreadsheet, [{ event: '補欠保存失敗', record: historyRecord }]); flush(); } catch (ignored) { /* 本抽選は変更しない */ }
+    throw new Error('補欠名簿の保存に失敗しました。本抽選と以前の補欠は削除していません。保存中・失敗の名簿を使用しないでください。');
+  }
+  const warnings = [];
+  old.forEach(function (item) {
+    try { spreadsheet.deleteSheet(item.sheet); } catch (error) { warnings.push('以前の補欠シートを保持: ' + item.sheet.getName()); }
+  });
+  return { baseRunId: source.record.runId, reserveId: id, ranked: result.ranked.length, unassigned: result.unassigned.length,
+    sheetNames: created.map(function (item) { return item.sheet.getName(); }), warnings: warnings };
+}
+
+function executeReservesOnSpreadsheet_(spreadsheet, options) {
+  const captured = readInputSheets_(spreadsheet);
+  const source = readSavedLotteryForReserves_(spreadsheet, captured, options.digest);
+  const result = buildReserveList_(source.prepared, source.assignments, source.fixedFirstByKey, source.record.seed, options.digest);
+  return writeReservePlans_(spreadsheet, source, result, options);
+}
+
+function createCommitteeReserves() {
+  const lock = LockService.getDocumentLock();
+  if (!lock || !lock.tryLock(1000)) throw new Error('別の抽選・補欠処理が実行中か、スプレッドシートに紐づいていません。');
+  try {
+    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet(); const now = new Date();
+    const summary = executeReservesOnSpreadsheet_(spreadsheet, {
+      runId: Utilities.formatDate(now, spreadsheet.getSpreadsheetTimeZone(), 'yyyyMMdd_HHmmss_SSS') + '_' + Utilities.getUuid().slice(0, 8),
+      startedAt: now.toISOString(), flush: function () { SpreadsheetApp.flush(); }
+    });
+    spreadsheet.toast('本抽選の当選者を維持し、補欠名簿を保存しました。' + (summary.warnings.length ? '\n旧補欠の整理に注意事項があります。' : ''), '委員抽選', 10);
+    return summary;
+  } finally { lock.releaseLock(); }
+}
+
 function verifyHistoryEntries_(captured, entries, digest) {
   const responsesHash = snapshotHash_(captured.responses.values, digest);
   const operationsHash = snapshotHash_(captured.operations.values, digest);
@@ -1155,6 +1372,7 @@ if (typeof module !== 'undefined' && module.exports) {
     personKey_, prepareLotteryInput_, checkPossible_, maximumClassCoverage_, utf8Bytes_, hashText_,
     createRandom_, runLotteryEngine_, readInputSheets_, buildOutputPlans_, writeOutputPlans_,
     executeLotteryOnSpreadsheet_, safeCell_, serializedRow_, makeRunRecord_, hashResult_,
-    historyRows_, collectOutputRuns_, verifyHistoryEntries_, readOutputNote_
+    historyRows_, collectOutputRuns_, verifyHistoryEntries_, readOutputNote_,
+    LOTTERY_RESERVE_VERSION, LOTTERY_RESERVE_LABELS, buildReserveList_, readSavedLotteryForReserves_, executeReservesOnSpreadsheet_
   };
 }
